@@ -30,14 +30,22 @@
 **CDP（Chrome DevTools Protocol）**でブラウザを駆動します。これにより OS 依存がなくなり、
 ページ遷移は DOM から確定的に取得でき、CDP をモックすればキャプチャ層が丸ごとテスト可能になります。
 
+さらに実機調査の結果、Cloud Reader は**ページをサーバ側でレンダリングした画像として配信**
+していることが分かりました（[ADR-0004](docs/adr/0004-page-acquisition.md)）。そのため
+スクリーンショットを撮る必要すらなく、**ページ画像を原寸で直接取得**できます。
+
+- UI（ヘッダー・矢印・進捗バー）が写り込まないため、**余白トリミングが不要**
+- 表示サイズ 1001×1128 に対し**原寸 1501×1692** を取得できる
+- 全画面化・ウィンドウ操作・マウス占有が一切不要（実行中も PC を普通に使える）
+
 ## 設計の要点
 
 ### フェーズ分割ワークフロー
 
 ```
-plan ─→ open ─→ capture ─→ validate ─→ trim ─→ ocr ─→ proofread ─→ assemble
-[any]  [browser] [browser]  [cpu]      [cpu]   [gpu]   [gpu/llm]    [cpu]
-  │        └─── Mac（低電力・長時間）───┘      └──── Windows（高性能・短時間）────┘
+plan ─→ open ─→ capture ─→ validate ─→ ocr ─→ proofread ─→ assemble
+[any]  [browser] [browser]  [cpu]      [gpu]   [gpu/llm]    [cpu]
+  │       └── Mac（低電力・長時間）──┘   └─── Windows（高性能・短時間）───┘
 ```
 
 各フェーズは「入力アーティファクト → 出力アーティファクト」の独立した処理で、
