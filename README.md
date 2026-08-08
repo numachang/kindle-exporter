@@ -35,9 +35,9 @@
 ### フェーズ分割ワークフロー
 
 ```
-plan ──→ open ──→ capture ──→ validate ──→ trim ──→ ocr ──→ assemble
-[any]    [browser] [browser]   [cpu]        [cpu]    [gpu]   [cpu]
-  │         └──── Mac（低電力・長時間）────┘         └── Windows（高性能・短時間）──┘
+plan ─→ open ─→ capture ─→ validate ─→ trim ─→ ocr ─→ proofread ─→ assemble
+[any]  [browser] [browser]  [cpu]      [cpu]   [gpu]   [gpu/llm]    [cpu]
+  │        └─── Mac（低電力・長時間）───┘      └──── Windows（高性能・短時間）────┘
 ```
 
 各フェーズは「入力アーティファクト → 出力アーティファクト」の独立した処理で、
@@ -58,6 +58,21 @@ plan ──→ open ──→ capture ──→ validate ──→ trim ──�
 | PDF・Markdown 組み立て | Python |
 
 Rust ↔ Python 間は JSON Lines over stdio。スキーマを単一の真実として両側から契約テストします。
+
+### 日本語のルビと OCR 精度
+
+日本語書籍のルビ（振り仮名）を正確に取り出すこと、および OCR の精度揺れへの対策を
+設計要件としています。方針と実測データは
+[docs/adr/0003-ruby-and-ocr-accuracy.md](docs/adr/0003-ruby-and-ocr-accuracy.md) にあります。
+
+- **最も精度の高い手法は「OCR しないこと」** — 本文はブラウザが描画した born-digital の
+  テキストなので、DOM から実文字を取れれば精度は 100%、ルビも `<ruby><rt>` から構造ごと取れる
+- OCR 経路（マンガ・固定レイアウト本）では、ルビ列を**分割せず一括認識**し（実測 96%）、
+  精度 100% の本文から得た読み候補と DP アライメントして相互に検証する
+- **信頼度スコアは誤り検出に使わない** — 明らかな誤認識でも CONF が 0.93〜0.95 のまま
+  だったため、低信頼度の箇所だけを校閲する設計は成立しない
+- **校閲は独立フェーズ**とし、ローカル LLM には自由な書き換えをさせず、
+  検証可能な**編集操作のリスト**を出力させて監査証跡を残す
 
 ### テスト方針
 
