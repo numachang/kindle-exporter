@@ -1,0 +1,19 @@
+[package]
+name = "ke-nav"
+description = "Kindle Cloud Reader のナビゲーション状態機械。I/O を持たない純粋関数。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# ADR-0001 §5: ke-nav は ke-core にしか依存しない。
+[dependencies]
+ke-core = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

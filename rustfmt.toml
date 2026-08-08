@@ -1,0 +1,5 @@
+# 既定の rustfmt は構造体リテラルや引数をすぐ縦に割るため、
+# 短いものは 1 行に収める。差分が読みやすくなる。
+edition = "2024"
+max_width = 100
+use_small_heuristics = "Max"

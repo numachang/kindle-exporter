@@ -1,6 +1,6 @@
 [package]
 name = "ke-core"
-description = "kindle-exporter のドメイン型。I/O を持たず、他の crate に依存しない。"
+description = "kindle-exporter のドメイン型。I/O を持たず、他の ke-* crate に依存しない。"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# ADR-0001 §5 の「依存ゼロ」は ke-* crate 間の依存を指す。
+# アーティファクトと events.jsonl のために serde だけは必要。
 [dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

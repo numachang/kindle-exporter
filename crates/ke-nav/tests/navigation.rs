@@ -1,0 +1,394 @@
+//! ナビゲーション状態機械を、実機を一切使わずに端から端まで動かす。
+//!
+//! 派生元の `kindle_shot` はこの層にテストが 1 件も無く、
+//! 「Win32 実機依存のため対象外」と明記されていた。
+//! 状態機械から I/O を追い出したことで、ここが全部テストできるようになる
+//! （ADR-0001 §6a）。
+
+// clippy.toml の allow-*-in-tests は #[cfg(test)] モジュールにしか効かない。
+// tests/ 配下は独立した crate なので、ここで明示的に許可する。
+#![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
+
+use ke_core::{
+    Action, Asin, BookSpec, DisplayTarget, Failure, Observation, PageImageInfo, PageLabel,
+    PageMetrics, Rect, Theme,
+};
+use ke_nav::{Limits, Navigator};
+
+/// テストで無限ループにならないための保険。
+const MAX_STEPS: usize = 4_000;
+
+/// スライダー位置から画素/文字を返す関数（ADR-0005 実測 3 を模した段階的な応答）。
+type FontResponse = fn(f32) -> u32;
+
+fn measured_from_slider(fraction: f32) -> u32 {
+    match fraction {
+        f if f < 0.5 => 27,
+        f if f < 0.8 => 45,
+        _ => 51,
+    }
+}
+
+/// 右へ大きく動かさないと目標に届かないリーダー（再校正が要る場合の検証用）。
+fn stiff_slider(fraction: f32) -> u32 {
+    if fraction < 0.7 { 27 } else { 45 }
+}
+
+/// 常に目標に届かないリーダー（校正が収束しない場合の検証用）。
+fn always_tiny(_fraction: f32) -> u32 {
+    12
+}
+
+/// リーダーの模擬。行動を受けて内部状態を動かし、次の観測を作る。
+struct FakeReader {
+    page: u32,
+    total: Option<u32>,
+    /// 読み込み完了までに必要な観測回数。
+    load_ticks: u32,
+    ticks: u32,
+    menu_open: bool,
+    /// メニューが開けるか（開けない障害の再現用）。
+    menu_operable: bool,
+    theme: Option<Theme>,
+    slider: f32,
+    font_response: FontResponse,
+    /// 次の観測に実測値を載せるか。
+    emit_metrics: bool,
+    /// ページ送りを受け付けるか（進まなくなる障害の再現用）。
+    can_advance: bool,
+    /// 巻き戻しで到達できる最小ページ（1 に戻れない書籍の再現用）。
+    min_page: u32,
+    /// 位置表示を持つか。
+    has_label: bool,
+    captured: Vec<PageLabel>,
+}
+
+impl FakeReader {
+    fn new(page: u32, total: u32) -> Self {
+        Self {
+            page,
+            total: Some(total),
+            load_ticks: 0,
+            ticks: 0,
+            menu_open: false,
+            menu_operable: true,
+            theme: Some(Theme::Dark),
+            slider: 0.5,
+            font_response: measured_from_slider,
+            emit_metrics: false,
+            can_advance: true,
+            min_page: 1,
+            has_label: true,
+            captured: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self) -> Observation {
+        self.ticks += 1;
+        let loaded = self.ticks > self.load_ticks;
+        Observation {
+            elapsed_ms: 1_000,
+            page: (loaded && self.has_label).then(|| PageLabel::new(self.page, self.total)),
+            image: loaded.then(|| {
+                PageImageInfo::ready(1501, 1692).with_source(format!("blob:page-{}", self.page))
+            }),
+            settings_menu_open: self.menu_open,
+            font_slider: self.menu_open.then(|| Rect::new(1455.0, 217.0, 312.0, 42.0)),
+            theme: self.theme,
+            metrics: self.take_metrics(),
+        }
+    }
+
+    fn take_metrics(&mut self) -> Option<PageMetrics> {
+        if !std::mem::take(&mut self.emit_metrics) {
+            return None;
+        }
+        Some(PageMetrics { px_per_char: (self.font_response)(self.slider), chars: 536 })
+    }
+
+    fn apply(&mut self, action: &Action) {
+        match action {
+            Action::OpenSettingsMenu if self.menu_operable => self.menu_open = true,
+            Action::CloseSettingsMenu if self.menu_operable => self.menu_open = false,
+            Action::SetTheme(t) => self.theme = Some(*t),
+            Action::ClickFontSlider { fraction } => self.slider = *fraction,
+            Action::MeasurePage => self.emit_metrics = true,
+            Action::CapturePage { label } => self.captured.push(label.clone()),
+            Action::PressNext => self.turn(1),
+            Action::PressPrev => self.turn(-1),
+            _ => {}
+        }
+    }
+
+    fn turn(&mut self, delta: i64) {
+        if !self.can_advance {
+            return;
+        }
+        let next = i64::from(self.page) + delta;
+        let hi = self.total.map_or(i64::MAX, i64::from);
+        self.page = next.clamp(i64::from(self.min_page), hi).try_into().unwrap_or(self.page);
+    }
+}
+
+/// 状態機械とリーダーを終端まで回し、最後の行動と全行動列を返す。
+fn drive(nav: &mut Navigator, reader: &mut FakeReader) -> (Action, Vec<Action>) {
+    let mut log = Vec::new();
+    for _ in 0..MAX_STEPS {
+        let obs = reader.observe();
+        let action = nav.step(&obs);
+        log.push(action.clone());
+        if action.is_terminal() {
+            return (action, log);
+        }
+        reader.apply(&action);
+    }
+    panic!("{MAX_STEPS} 手を超えても終端に達しなかった");
+}
+
+fn spec() -> BookSpec {
+    BookSpec::new(Asin::new("B0BQQSQT86").expect("固定の ASIN"), "テスト本")
+}
+
+fn quick_limits() -> Limits {
+    Limits { book_load_timeout_ms: 5_000, page_turn_timeout_ms: 2_000, ..Limits::default() }
+}
+
+fn count<F: Fn(&Action) -> bool>(log: &[Action], f: F) -> usize {
+    log.iter().filter(|a| f(a)).count()
+}
+
+// ------------------------------------------------------------------
+// 正常系
+// ------------------------------------------------------------------
+
+#[test]
+fn captures_a_whole_book_from_the_middle_of_it() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    // 33/431 ページ目から始める（実機で観測した状況）
+    let mut reader = FakeReader::new(33, 431);
+
+    let (last, log) = drive(&mut nav, &mut reader);
+
+    assert_eq!(
+        last,
+        Action::Done(ke_core::Summary {
+            captured_pages: 431,
+            px_per_char: Some(45),
+            end_confirmed: true
+        })
+    );
+    assert_eq!(reader.captured.len(), 431, "先頭から末尾まで撮る");
+    assert_eq!(reader.captured.first(), Some(&PageLabel::new(1, Some(431))));
+    assert_eq!(reader.captured.last(), Some(&PageLabel::new(431, Some(431))));
+    assert_eq!(count(&log, |a| matches!(a, Action::CapturePage { .. })), 431);
+    // 同じページを二度撮っていない
+    let mut seen = reader.captured.clone();
+    seen.dedup();
+    assert_eq!(seen.len(), 431);
+}
+
+#[test]
+fn opens_the_book_by_its_reader_url_first() {
+    let mut nav = Navigator::new(spec());
+    let obs = Observation::default();
+    assert_eq!(
+        nav.step(&obs),
+        Action::OpenBook { url: "https://read.amazon.co.jp/?asin=B0BQQSQT86".into() }
+    );
+}
+
+#[test]
+fn sets_the_theme_before_touching_the_font_slider() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 3);
+    let (_, log) = drive(&mut nav, &mut reader);
+
+    let theme_at = log.iter().position(|a| matches!(a, Action::SetTheme(_)));
+    let font_at = log.iter().position(|a| matches!(a, Action::ClickFontSlider { .. }));
+    assert!(theme_at.is_some(), "暗色のままなら明色に変える");
+    assert!(theme_at < font_at, "テーマを決めてからフォントを触る");
+    assert_eq!(reader.theme, Some(Theme::White), "白地黒字にして反転処理を不要にする");
+}
+
+#[test]
+fn skips_the_theme_step_when_it_is_already_correct() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 2);
+    reader.theme = Some(Theme::White);
+    let (_, log) = drive(&mut nav, &mut reader);
+    assert_eq!(count(&log, |a| matches!(a, Action::SetTheme(_))), 0);
+}
+
+#[test]
+fn recalibrates_the_font_until_the_target_is_met() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 2);
+    // 初手（0.5）では届かないので、右へ動かし直す必要がある
+    reader.font_response = stiff_slider;
+
+    let (_, log) = drive(&mut nav, &mut reader);
+
+    let clicks: Vec<f32> = log
+        .iter()
+        .filter_map(|a| match a {
+            Action::ClickFontSlider { fraction } => Some(*fraction),
+            _ => None,
+        })
+        .collect();
+    assert!(clicks.len() >= 2, "1 回で決まらないなら再校正する: {clicks:?}");
+    assert!(clicks.windows(2).all(|w| w[1] > w[0]), "小さすぎるので右へ動かし続ける: {clicks:?}");
+    assert_eq!(nav.px_per_char(), Some(45), "目標範囲に収束する");
+}
+
+#[test]
+fn accepts_a_larger_font_when_the_ruby_preset_is_requested() {
+    let mut s = spec();
+    s.display = DisplayTarget::ruby_first();
+    let mut nav = Navigator::with_limits(s, quick_limits());
+    let mut reader = FakeReader::new(1, 2);
+    drive(&mut nav, &mut reader);
+    assert_eq!(nav.px_per_char(), Some(51));
+}
+
+#[test]
+fn rewinds_to_the_first_page_before_capturing() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(50, 60);
+    let (_, log) = drive(&mut nav, &mut reader);
+
+    let first_capture = log.iter().position(|a| matches!(a, Action::CapturePage { .. }));
+    let prev_count = count(&log, |a| matches!(a, Action::PressPrev));
+    assert!(prev_count >= 49, "50 ページ目から先頭まで戻る: {prev_count}");
+    assert!(first_capture.is_some());
+    assert_eq!(reader.captured.first(), Some(&PageLabel::new(1, Some(60))));
+}
+
+#[test]
+fn does_not_rewind_when_already_on_the_first_page() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 3);
+    let (_, log) = drive(&mut nav, &mut reader);
+    assert_eq!(count(&log, |a| matches!(a, Action::PressPrev)), 0);
+}
+
+/// 先頭に戻れない書籍でも、位置が動かなくなったら撮影に移る。
+#[test]
+fn treats_a_stalled_rewind_as_the_start_of_the_book() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(20, 30);
+    reader.min_page = 5; // 5 ページ目より前には戻れない
+
+    let (last, _) = drive(&mut nav, &mut reader);
+
+    assert!(matches!(last, Action::Done(_)), "止まっても失敗にはしない: {last:?}");
+    assert_eq!(reader.captured.first(), Some(&PageLabel::new(5, Some(30))));
+}
+
+/// 位置表示を持たない書籍は、ページ画像の blob URL の変化で送りを判定する。
+#[test]
+fn captures_books_without_a_page_label() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 4);
+    reader.has_label = false;
+
+    let (last, _) = drive(&mut nav, &mut reader);
+
+    assert!(matches!(last, Action::Done(_)), "{last:?}");
+    assert!(reader.captured.len() >= 4, "撮れた枚数: {}", reader.captured.len());
+    // 位置表示が無いので 1 起点の連番で代用する
+    assert_eq!(reader.captured.first(), Some(&PageLabel::new(1, None)));
+}
+
+// ------------------------------------------------------------------
+// 異常系
+// ------------------------------------------------------------------
+
+#[test]
+fn fails_when_the_book_never_loads() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 10);
+    reader.load_ticks = u32::MAX; // いつまでも描画されない
+
+    let (last, log) = drive(&mut nav, &mut reader);
+
+    assert!(
+        matches!(last, Action::Fail(Failure::BookDidNotLoad { waited_ms }) if waited_ms >= 5_000),
+        "{last:?}"
+    );
+    assert_eq!(count(&log, |a| matches!(a, Action::CapturePage { .. })), 0);
+}
+
+#[test]
+fn fails_when_the_settings_menu_never_opens() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 10);
+    reader.menu_operable = false;
+
+    let (last, _) = drive(&mut nav, &mut reader);
+
+    assert_eq!(last, Action::Fail(Failure::SettingsMenuUnavailable));
+}
+
+#[test]
+fn fails_when_a_page_stops_advancing_before_the_end() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 100);
+    reader.can_advance = false; // 巻き戻しも送りも効かない
+
+    let (last, _) = drive(&mut nav, &mut reader);
+
+    assert!(
+        matches!(&last, Action::Fail(Failure::PageDidNotAdvance { at }) if at.current == 1),
+        "{last:?}"
+    );
+}
+
+#[test]
+fn stops_at_the_page_cap_instead_of_running_away() {
+    let limits = Limits { max_pages: 5, ..quick_limits() };
+    let mut nav = Navigator::with_limits(spec(), limits);
+    let mut reader = FakeReader::new(1, 10_000);
+
+    let (last, _) = drive(&mut nav, &mut reader);
+
+    assert_eq!(last, Action::Fail(Failure::TooManyPages { limit: 5 }));
+}
+
+/// 目標に届かない設定でも、校正を諦めて撮影に進む（1 冊を落とさない）。
+#[test]
+fn proceeds_with_the_best_effort_when_calibration_cannot_converge() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 3);
+    reader.font_response = always_tiny;
+
+    let (last, log) = drive(&mut nav, &mut reader);
+
+    assert!(matches!(last, Action::Done(_)), "校正に失敗しても撮影はする: {last:?}");
+    assert_eq!(nav.px_per_char(), Some(12), "実測できた最後の値を記録する");
+    let clicks = count(&log, |a| matches!(a, Action::ClickFontSlider { .. }));
+    assert!(clicks <= usize::from(DisplayTarget::default().max_calibration_attempts));
+}
+
+#[test]
+fn keeps_returning_the_same_result_after_it_has_ended() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 2);
+    let (last, _) = drive(&mut nav, &mut reader);
+
+    assert!(nav.is_ended());
+    let again = nav.step(&reader.observe());
+    assert_eq!(again, last, "終端後に呼んでも同じ結果を返し続ける");
+    assert_eq!(nav.step(&reader.observe()), last);
+}
+
+/// 記録・再生ハーネス（ADR-0001 §6b）の土台。行動列は JSON で保存・復元できる。
+#[test]
+fn the_action_log_can_be_persisted_as_a_fixture() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(3, 5);
+    let (_, log) = drive(&mut nav, &mut reader);
+
+    let json = serde_json::to_string(&log).expect("行動列は直列化できる");
+    let back: Vec<Action> = serde_json::from_str(&json).expect("復元できる");
+    assert_eq!(back, log);
+}

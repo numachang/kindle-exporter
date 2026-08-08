@@ -1,25 +1,31 @@
 //! kindle-exporter のドメイン型。
 //!
-//! この crate は **I/O を一切持たず、他の crate にも依存しない**。
-//! `Book` / `Page` / `Phase` / `Margins` / `Observation` / `Action` といった、
+//! この crate は **I/O を一切持たず、他の `ke-*` crate にも依存しない**。
 //! ワークフロー全体で共有される値だけを定義する。
 //!
-//! この制約が [`ke-nav`] の状態機械を実機ゼロでテスト可能にする土台になる。
-//! 詳細は `docs/adr/0001-architecture.md` を参照。
+//! この制約が `ke-nav` の状態機械を実機ゼロでテスト可能にする土台になる
+//! （`docs/adr/0001-architecture.md` §6a）。
 //!
-//! [`ke-nav`]: https://github.com/numachang/kindle-exporter
+//! # 構成
+//!
+//! - [`Asin`] / [`BookSpec`] — 何を処理するか
+//! - [`Phase`] / [`Capability`] — どの工程を、どのホストで実行するか
+//! - [`DisplayTarget`] / [`Theme`] — キャプチャ時のリーダー表示設定
+//! - [`PageLabel`] / [`PageImageInfo`] / [`PageMetrics`] — ページの位置・画像・品質
+//! - [`Observation`] / [`Action`] — 状態機械の入力と出力
 
 #![forbid(unsafe_code)]
 
-// 型定義はこれから追加する。
-// 追加順は docs/adr/0001-architecture.md §5 の crate 構成に従う。
+mod action;
+mod book;
+mod display;
+mod observation;
+mod page;
+mod phase;
 
-#[cfg(test)]
-mod tests {
-    /// ワークスペース・lint 設定・CI パイプラインが機能していることの確認。
-    /// 最初の実装が入った時点で削除する。
-    #[test]
-    fn workspace_is_wired_up() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub use action::{Action, Failure, Summary, WaitReason};
+pub use book::{Asin, AsinError, BookSpec};
+pub use display::{DisplayTarget, Theme};
+pub use observation::{Observation, Rect};
+pub use page::{PageImageInfo, PageLabel, PageMetrics};
+pub use phase::{ALL_PHASES, Capability, Phase};
