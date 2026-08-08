@@ -1,0 +1,5 @@
+# 各プラットフォームでネイティブにビルドする（クロスコンパイルはしない）。
+# macOS への cross-compile は Apple SDK が必要なため targets は指定しない。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

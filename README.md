@@ -1,0 +1,105 @@
+# kindle-exporter
+
+購入済み電子書籍を、**Mac でキャプチャし、Windows で OCR する**フェーズ分割型のエクスポートツール。
+検索可能 PDF / NotebookLM 向け Markdown を出力します。
+
+> **English:** A phase-based exporter for e-books you own. Capture runs on macOS (low power,
+> long-running), OCR runs on Windows (GPU, short burst). Outputs searchable PDF and Markdown.
+> Written in Rust (orchestration, browser driving, image pipeline) and Python (ONNX OCR, text layer).
+
+---
+
+## ステータス
+
+**設計フェーズ。実装はまだありません。**
+
+アーキテクチャは [docs/adr/0001-architecture.md](docs/adr/0001-architecture.md) に記録しています。
+着手前に検証すべき前提（スパイク）が 4 件あり、その結果次第で構成が変わります。
+
+## 何を解決するのか
+
+既存の同種ツールは、OS のスクリーンショット API でリーダーの画面を撮り、
+ピクセル差分でページ遷移を推測する方式が一般的です。この方式には構造的な問題があります。
+
+- Win32 API に直接依存し、macOS で動かない
+- 画面とマウスを占有するため、実行中は PC で他の作業ができない
+- 「ページが変わったか」をピクセル差分で推測するため不安定
+- 実機がないとテストが 1 行も書けない
+
+本プロジェクトは、Kindle Cloud Reader が**ただのブラウザページである**ことを利用し、
+**CDP（Chrome DevTools Protocol）**でブラウザを駆動します。これにより OS 依存がなくなり、
+ページ遷移は DOM から確定的に取得でき、CDP をモックすればキャプチャ層が丸ごとテスト可能になります。
+
+## 設計の要点
+
+### フェーズ分割ワークフロー
+
+```
+plan ──→ open ──→ capture ──→ validate ──→ trim ──→ ocr ──→ assemble
+[any]    [browser] [browser]   [cpu]        [cpu]    [gpu]   [cpu]
+  │         └──── Mac（低電力・長時間）────┘         └── Windows（高性能・短時間）──┘
+```
+
+各フェーズは「入力アーティファクト → 出力アーティファクト」の独立した処理で、
+必要なホスト能力（`browser` / `cpu` / `gpu`）を宣言します。
+共有ストレージ上の追記専用イベントログで状態を持つため、
+**マシンをまたいで中断・再開でき、機械間でパイプライン並列に動きます**
+（Mac が N+1 冊目を撮っている間に Windows が N 冊目を OCR する）。
+
+### 言語構成
+
+| レイヤ | 言語 |
+|---|---|
+| CLI・オーケストレータ・フェーズ実行 | Rust |
+| CDP ドライバ（ブラウザ駆動） | Rust |
+| ナビゲーション状態機械（I/O なしの純粋関数） | Rust |
+| 画像処理（検証・余白検出・トリム） | Rust + rayon |
+| OCR 推論（NDLOCR-Lite / ONNX Runtime） | Python |
+| PDF・Markdown 組み立て | Python |
+
+Rust ↔ Python 間は JSON Lines over stdio。スキーマを単一の真実として両側から契約テストします。
+
+### テスト方針
+
+キャプチャ層は「実機がないとテストできない」ものとして扱いません。
+
+- **ナビゲーションは I/O を持たない純粋な状態機械**（`step(Observation) -> Action`）として実装し、
+  実機ゼロでユニットテスト・property test する
+- **record / replay ハーネス** — 実行時の全 Observation / Action を JSONL に記録し、
+  実機で起きた事故をそのまま回帰テストのフィクスチャにできる
+- 循環的複雑度は CI で機械的に強制（clippy `cognitive_complexity` / ruff `C901`）
+
+## 免責・利用上の注意
+
+- 本ツールは、**利用者自身が購入した電子書籍**の私的複製（著作権法 30 条）を支援する目的で作られています
+- 画面に表示された内容を取得する方式であり、**DRM の技術的保護手段を回避する機能は含みません**
+- 一方で、Amazon Kindle をはじめとする各サービスの**利用規約に抵触する可能性があります**。
+  利用は各自の責任と判断で行ってください
+- 出力したファイルの再配布・共有・公開は行わないでください
+- 本ソフトウェアは無保証で提供されます。詳細はライセンス条項を参照してください
+
+### 商標について
+
+Kindle および Amazon は Amazon.com, Inc. またはその関連会社の商標です。
+本プロジェクトは Amazon とは一切関係がなく、承認・後援を受けているものでもありません。
+プロジェクト名およびドキュメント中の商標への言及は、互換性を示すための指示的使用です。
+
+## ライセンス
+
+以下のいずれかを、利用者の選択により適用できます。
+
+- Apache License, Version 2.0（[LICENSE-APACHE](LICENSE-APACHE) または <http://www.apache.org/licenses/LICENSE-2.0>）
+- MIT License（[LICENSE-MIT](LICENSE-MIT) または <http://opensource.org/licenses/MIT>）
+
+判断の経緯は [docs/adr/0002-license.md](docs/adr/0002-license.md) を参照してください。
+
+### コントリビューション
+
+明示的に別段の意思表示をしない限り、Apache-2.0 ライセンスに定義される、
+本プロジェクトへの組み入れを意図して提出されたコントリビューションは、
+追加の条件なしに上記のデュアルライセンスで提供されるものとします。
+
+### サードパーティ
+
+本プロジェクトは第三者のソフトウェアを利用・参照しています。
+著作権者とライセンス条項は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) を参照してください。

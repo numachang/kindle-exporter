@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # capture は macOS、ocr は Windows で動くため両方を常時検証する
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: rustup show && rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # 複雑度ゲート（ADR-0001 §6d）。閾値は clippy.toml で定義。
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets --all-features
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        if: hashFiles('py/pyproject.toml') != ''
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        if: hashFiles('py/pyproject.toml') != ''
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        if: hashFiles('py/pyproject.toml') != ''
+        working-directory: py
+        run: uv sync --all-extras --dev
+
+      # 複雑度ゲート（ADR-0001 §6d）。C901 は pyproject.toml で有効化する。
+      - name: Ruff
+        if: hashFiles('py/pyproject.toml') != ''
+        working-directory: py
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Pytest
+        if: hashFiles('py/pyproject.toml') != ''
+        working-directory: py
+        run: uv run pytest -q
+
+      - name: Skip notice
+        if: hashFiles('py/pyproject.toml') == ''
+        run: echo "py/ はまだ存在しないためスキップします。"

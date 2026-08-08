@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+# crate は ADR-0001 §5 の構成に沿って順次追加する:
+#   ke-core / ke-cdp / ke-nav / ke-imaging / ke-store / ke-workflow / ke-cli
+members = ["crates/ke-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/numachang/kindle-exporter"
+authors = ["numachang"]
+
+# 複雑度は CI で機械的に強制する（ADR-0001 §6d）。
+# 各 crate は Cargo.toml に `[lints] workspace = true` を書いて継承すること。
+[workspace.lints.clippy]
+cognitive_complexity = "deny"
+too_many_lines = "deny"
+too_many_arguments = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "warn"

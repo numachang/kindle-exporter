@@ -1,0 +1,35 @@
+# --- Rust ---
+/target/
+**/*.rs.bk
+*.pdb
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- 成果物・作業データ ---
+# 書籍アーティファクト（ページ画像・OCR結果・出力PDF）は絶対にコミットしない
+/library/
+*.pdf
+*.epub
+*.azw*
+# record/replay のフィクスチャは fixtures/ 配下のみ明示的に追加する
+/recordings/
+
+# --- ローカル設定・秘密情報 ---
+.env
+*.local.toml
+config.local.json
+
+# --- エディタ / OS ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

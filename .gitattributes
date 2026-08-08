@@ -1,0 +1,14 @@
+# macOS と Windows の両方で開発するため、リポジトリ内は LF に統一する。
+* text=auto eol=lf
+
+# Windows 専用スクリプトのみ CRLF を維持する
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# バイナリ（フィクスチャのページ画像など）
+*.png  binary
+*.jpg  binary
+*.webp binary
+*.pdf  binary
+*.onnx binary

@@ -1,0 +1,10 @@
+# ADR-0001 §6d: 複雑度の機械的強制。
+# 派生元の kindle_shot は循環的複雑度 10 超が 20 関数、最大 29 だった。再発させない。
+cognitive-complexity-threshold = 10
+too-many-lines-threshold = 80
+too-many-arguments-threshold = 7
+
+# テストコードでは unwrap / expect / panic を許可する
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
