@@ -11,6 +11,10 @@
 //! **判断はここに置かない。** 「次に何をすべきか」は `ke-nav` の責務であり、
 //! この層は「言われたことをやる」「見えたものを報告する」だけを行う。
 //!
+//! [`Session`] は 1 回の実行を JSON Lines に落とし、[`ReplayBrowser`] で
+//! 実機なしに再生する（ADR-0001 §6b）。実機で事故が起きたときに、
+//! **その状況をそのまま回帰テストにできる**ようにするためのものである。
+//!
 //! # 実機の癖（ADR-0007。忘れると必ず詰まる）
 //!
 //! - **JS は isolated world で評価する。** Amazon が `window.fetch` を
@@ -29,11 +33,13 @@ mod error;
 mod fake;
 mod js;
 mod reader;
+mod record;
 
 pub use client::Endpoint;
 pub use error::{Error, Result};
 pub use fake::FakeBrowser;
 pub use reader::CdpBrowser;
+pub use record::{Divergence, ReplayBrowser, Session, Step};
 
 use ke_core::{Action, Observation, PageLabel, Theme};
 

@@ -12,7 +12,7 @@
 | 設計 | ADR-0001 〜 0007 で確定。未検証項目は下記「残っている不確実性」 |
 | `ke-core` | **完了**（ドメイン型、テスト 36 件） |
 | `ke-nav` | **完了**（純粋状態機械 + フォント校正、テスト 32 件） |
-| `ke-cdp` | **完了**（`trait Browser` + `FakeBrowser` + CDP クライアント、テスト 27 件） |
+| `ke-cdp` | **完了**（`trait Browser` + `FakeBrowser` + CDP クライアント + 記録/再生、テスト 40 件） |
 | `ke-imaging` / `ke-store` / `ke-workflow` / `ke-cli` | 未着手 |
 | Python 側（`ke_ocr` / `ke_text`） | 未着手 |
 | CI | Rust 3 OS + Python（`py/` が出来たら自動で有効化）すべて green |
@@ -31,20 +31,48 @@
 
 ---
 
-## 1. record / replay ハーネス
+## 1. record / replay ハーネス — **完了**
 
-ADR-0001 §6b。**本設計の主眼**であり、`ke-cdp` の直後に作る。
-`ke-cdp` のテスト（`crates/ke-cdp/tests/browser.rs`）にある `Session` が原型になる。
+ADR-0001 §6b。`ke-cdp` の [`Session`] / [`ReplayBrowser`] として実装した。
 
-- `ke capture --record <path>` で全 [`Observation`] と [`Action`] を JSONL に落とす
-- `FakeBrowser` が JSONL を再生する
-- 実機で事故が起きたらそのログを `fixtures/sessions/` に置くだけで回帰テストになる
+- 1 手（[`Observation`] と [`Action`] の対）を 1 行の JSON Lines に落とす
+- [`ReplayBrowser`] が実機なしで再生し、`Session::diverged_from` が
+  **何手目で判断が変わったか**を報告する
+- `crates/ke-cdp/fixtures/sessions/*.jsonl` に置いたものは CI で自動的に検証される。
+  **実機で事故が起きたら、その記録をここに置くだけで回帰テストになる**
 
-[`Observation`] と [`Action`] は既に JSON で往復できる（`ke-core` のテストで固定済み）。
+```bash
+# 実機を本番ループで回して記録する（ページ画像は保存しない）
+cargo run -p ke-cdp --example probe -- capture <ASIN> 15 out.jsonl
+# フィクスチャを作り直す
+cargo test -p ke-cdp --test browser -- --ignored regenerate
+```
+
+**記録するのは観測と行動だけで、ページ画像は記録しない**（書籍の中身なので）。
+保存時に `Session::redacted` で ASIN を伏せる。CI がそれを機械的に検査する。
+
+> **既知の制約:** 記録は**同じ `Limits` でしか再生できない**。打ち切り条件が
+> 変わると判断も変わるため。記録側に条件を持たせるのは今後の課題。
+
+早速このハーネスが 2 つ仕事をした。1 つはページ送りの間隔を実測から
+180ms に決めたこと（1 枚 492ms → 227ms。ADR-0007 実測 12）。
+もう 1 つは、その変更でフィクスチャの判断が変わったことを CI が検出したこと。
 
 ---
 
-## 2. `ke-store` — アーティファクトとイベントログ
+## 2. `ke-workflow` — 本番ループと再開
+
+`crates/ke-cdp/tests/browser.rs` の `Capture` と、
+`examples/probe.rs` の `capture_book` が原型になっている。両方とも
+「観測 → 判断 → 実行 → 記録」を回しているだけなので、これを製品コードにする。
+
+- **1 冊を通しで撮り切る**（現状は 15 枚までしか通していない）
+- 画素/文字の実測を Python 側に渡す（3 と連動）。いまは仮の対応表で代用している
+- lease と再開（ADR-0001 §3）
+
+---
+
+## 3. `ke-store` — アーティファクトとイベントログ
 
 ADR-0001 §3 の配置を実装する。
 
@@ -64,7 +92,7 @@ library/<book-id>/
 
 ---
 
-## 3. Python 側 — `ke_ocr` 常駐ワーカー
+## 4. Python 側 — `ke_ocr` 常駐ワーカー
 
 - `onnxruntime` を直接呼ぶ。**CLI（`src/ocr.py`）は使わない**
   （モデルロード 19 秒 × チャンク数が丸ごと無駄になる）
@@ -81,7 +109,7 @@ library/<book-id>/
 
 ---
 
-## 4. ルビ復元パイプライン
+## 5. ルビ復元パイプライン
 
 ADR-0003 決定 2 + ADR-0005 決定 4。
 
@@ -102,7 +130,7 @@ ADR-0003 決定 2 + ADR-0005 決定 4。
 
 ---
 
-## 5. `proofread` フェーズ — ローカル LLM 校閲
+## 6. `proofread` フェーズ — ローカル LLM 校閲
 
 ADR-0003 決定 4。
 
@@ -115,7 +143,7 @@ ADR-0003 決定 4。
 
 ---
 
-## 6. `ke_text` — 組み立て（`kindle_shot` から流用）
+## 7. `ke_text` — 組み立て（`kindle_shot` から流用）
 
 MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済み。
 派生ファイルの冒頭に由来コメントを入れること。
@@ -132,7 +160,7 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 
 ---
 
-## 7. `ke-imaging` / `ke-workflow` / `ke-cli`
+## 8. `ke-imaging` / `ke-workflow` / `ke-cli`
 
 - **`ke-imaging`**: 白紙・重複・サイズ違いの検証だけ。**余白検出は不要**
   （ADR-0004 決定 2 で `trim` フェーズを削除した）。rayon で並列化
@@ -142,7 +170,7 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 
 ---
 
-## 8. `plan` フェーズ
+## 9. `plan` フェーズ
 
 - 蔵書一覧 → `books.json`。`Xetera/kindle-api`（Node.js から Kindle の内部 API を叩く）が
   使えるか検討する
@@ -210,7 +238,8 @@ GPU を使う場合の NVIDIA ランタイム（`os.add_dll_directory` が必要
 
 | 項目 | 値 | 出典 |
 |---|---|---|
-| **ページ送り + 取得（`ke-cdp` 経由）** | **194〜321ms/頁**（最小化しても同じ） | ADR-0007 実測 10 |
+| **本番ループ 1 ページ**（`ke-nav` + `ke-cdp`） | **227ms/頁** | ADR-0007 実測 12 |
+| 反映を見る間隔 | **180ms が底**。短いと空振りを買って逆に遅い | ADR-0007 実測 12 |
 | 巻末・先頭の確定シグナル | chevron が **DOM から消える**（矩形 0 は「隠れている」だけ） | ADR-0007 実測 11 |
 | Chrome の絞り込み無効フラグ | **必須**。無いと隠れた瞬間に 1.8 秒/頁へ | ADR-0007 実測 10 |
 | **送りの最小間隔** | **100ms。これより短いと黙って無視される** | ADR-0007 実測 8 |
@@ -233,6 +262,8 @@ GPU を使う場合の NVIDIA ランタイム（`os.add_dll_directory` が必要
 
 [`Action`]: ../crates/ke-core/src/action.rs
 [`Observation`]: ../crates/ke-core/src/observation.rs
+[`Session`]: ../crates/ke-cdp/src/record.rs
+[`ReplayBrowser`]: ../crates/ke-cdp/src/record.rs
 
 ---
 

@@ -11,7 +11,7 @@
 // clippy.toml の allow-*-in-tests は #[cfg(test)] モジュールにしか効かない。
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
-use ke_cdp::{Browser, Direction, Effect, FakeBrowser, PageImage, apply};
+use ke_cdp::{Browser, Direction, Effect, FakeBrowser, PageImage, ReplayBrowser, apply};
 use ke_core::{Action, Asin, BookSpec, DisplayTarget, Failure, PageLabel, PageMetrics, Theme};
 use ke_nav::{Limits, Navigator};
 
@@ -37,23 +37,32 @@ fn quick_limits() -> Limits {
 }
 
 /// `ke-nav` と [`Browser`] を噛み合わせて 1 冊を回す。
-struct Session {
+///
+/// **1 手ごとに観測と行動を記録する。** これが `ke-workflow` に持っていく形であり、
+/// 実機で事故が起きたときに状況をそのまま持ち帰る仕組みでもある（ADR-0001 §6b）。
+struct Capture {
     nav: Navigator,
     browser: FakeBrowser,
     /// `MeasurePage` の結果。次の観測に差し込む。
     pending: Option<PageMetrics>,
     captured: Vec<(PageLabel, PageImage)>,
-    log: Vec<Action>,
+    record: ke_cdp::Session,
 }
 
-impl Session {
+impl Capture {
     fn new(spec: BookSpec, browser: FakeBrowser) -> Self {
+        Self::with_limits(spec, browser, quick_limits())
+    }
+
+    /// フィクスチャは**既定の打ち切り条件**で作る。記録は同じ条件でしか
+    /// 再生できないため、テスト用の短い条件で作ると再生時にずれる。
+    fn with_limits(spec: BookSpec, browser: FakeBrowser, limits: Limits) -> Self {
         Self {
-            nav: Navigator::with_limits(spec, quick_limits()),
+            nav: Navigator::with_limits(spec, limits),
             browser,
             pending: None,
             captured: Vec::new(),
-            log: Vec::new(),
+            record: ke_cdp::Session::new(),
         }
     }
 
@@ -63,7 +72,8 @@ impl Session {
             obs.metrics = self.pending.take();
 
             let action = self.nav.step(&obs);
-            self.log.push(action.clone());
+            // 実測値を差し込んだ後の観測を記録する。そうでないと再生できない。
+            self.record.push(obs, action.clone());
 
             match apply(&mut self.browser, &action).expect("模擬の実行は失敗しない") {
                 Effect::Terminal => return action,
@@ -82,7 +92,7 @@ impl Session {
 
 #[test]
 fn captures_a_whole_book_without_touching_a_real_browser() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(20).starting_at(7));
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(20).starting_at(7));
 
     let last = s.run();
 
@@ -98,22 +108,131 @@ fn captures_a_whole_book_without_touching_a_real_browser() {
     assert_eq!(pngs.len(), 20, "取り出した画像が重複している");
 }
 
-/// 記録・再生ハーネス（ADR-0001 §6b）の土台。実機で事故が起きたときに、
-/// そのセッションの行動列をそのまま回帰テストにできる必要がある。
+// ------------------------------------------------------------------
+// 記録・再生（ADR-0001 §6b。本設計の主眼）
+// ------------------------------------------------------------------
+
+/// 記録を、実機なしで状態機械にもう一度食わせ、同じ判断になるか見る。
+fn replay(recording: &ke_cdp::Session) -> Vec<Action> {
+    let mut nav = Navigator::with_limits(spec(), Limits::default());
+    let mut browser = ReplayBrowser::new(recording);
+    let mut produced = Vec::new();
+    while !browser.is_exhausted() {
+        let obs = browser.observe().expect("記録された観測を返す");
+        let action = nav.step(&obs);
+        produced.push(action.clone());
+        if apply(&mut browser, &action).expect("再生では失敗しない") == Effect::Terminal {
+            break;
+        }
+    }
+    produced
+}
+
+/// 記録 → 保存 → 読み込み → 再生で、同じ判断が再現できる。
 #[test]
-fn the_whole_session_can_be_saved_as_a_fixture() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(5).using_locations());
+fn a_recorded_session_replays_to_the_same_decisions() {
+    let browser = FakeBrowser::with_pages(6).using_locations();
+    let mut s = Capture::with_limits(spec(), browser, Limits::default());
+    s.run();
+    assert!(s.record.len() > 10, "1 冊分の記録になっている: {}", s.record.len());
+
+    let mut buffer = Vec::new();
+    s.record.write_jsonl(&mut buffer).expect("記録は書き出せる");
+    let loaded = ke_cdp::Session::read_jsonl(buffer.as_slice()).expect("読み戻せる");
+    assert_eq!(loaded, s.record);
+
+    assert_eq!(loaded.diverged_from(&replay(&loaded)), None);
+}
+
+/// 判断が変わったら、**何手目で変わったか**まで分かる。
+/// これが分からないと、記録を持ち帰っても原因に辿り着けない。
+#[test]
+fn a_changed_decision_is_reported_with_its_position() {
+    let browser = FakeBrowser::with_pages(4);
+    let mut s = Capture::with_limits(spec(), browser, Limits::default());
     s.run();
 
-    let json = serde_json::to_string(&s.log).expect("行動列は直列化できる");
-    let back: Vec<Action> = serde_json::from_str(&json).expect("復元できる");
-    assert_eq!(back, s.log);
-    assert!(s.log.len() > 10, "1 冊分の行動列になっている: {}", s.log.len());
+    let mut produced = replay(&s.record);
+    produced[3] = Action::PressPrev; // 状態機械が変わったことにする
+
+    let d = s.record.diverged_from(&produced).expect("ずれを見つける");
+    assert_eq!(d.at, 3);
+    assert_eq!(d.produced, Action::PressPrev);
+}
+
+/// リポジトリに置いてあるフィクスチャが、いまの状態機械でも同じ判断になるか。
+///
+/// **実機で事故が起きたら、その記録をここに置くだけで回帰テストになる。**
+/// 置く前に [`ke_cdp::Session::redacted`] を通して ASIN を伏せること。
+#[test]
+fn the_recorded_fixtures_still_produce_the_same_decisions() {
+    let dir = fixture_dir();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("fixtures/sessions/ がある") {
+        let path = entry.expect("読める").path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        let recording = ke_cdp::Session::load(&path).expect("記録を読める");
+        assert_eq!(
+            recording.diverged_from(&replay(&recording)),
+            None,
+            "{} の判断が変わりました",
+            path.display()
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "{} にフィクスチャがありません", dir.display());
+}
+
+/// 公開リポジトリに実在の ASIN を置かない、という約束を機械で守る。
+#[test]
+fn no_fixture_points_at_a_real_book() {
+    for entry in std::fs::read_dir(fixture_dir()).expect("fixtures/sessions/ がある") {
+        let path = entry.expect("読める").path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("読める");
+        for line in text.lines().filter(|l| l.contains("asin=")) {
+            assert!(
+                line.contains("asin=B0TESTBOOK"),
+                "{} に伏せていない ASIN があります",
+                path.display()
+            );
+        }
+    }
+}
+
+fn fixture_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join("sessions")
+}
+
+/// フィクスチャを作り直す。実機の記録に差し替えるときにも使う。
+///
+/// ```text
+/// cargo test -p ke-cdp --test browser -- --ignored regenerate
+/// ```
+#[test]
+#[ignore = "フィクスチャを更新するときだけ実行する"]
+fn regenerate_the_fixtures() {
+    let dir = fixture_dir();
+    std::fs::create_dir_all(&dir).expect("作れる");
+
+    for (name, browser) in [
+        ("location-book", FakeBrowser::with_pages(6).using_locations()),
+        ("page-numbered-book", FakeBrowser::with_pages(5).starting_at(3)),
+        ("book-without-labels", FakeBrowser::with_pages(4).without_labels()),
+    ] {
+        let mut s = Capture::with_limits(spec(), browser, Limits::default());
+        s.run();
+        s.record.redacted().save(&dir.join(format!("{name}.jsonl"))).expect("保存できる");
+    }
 }
 
 #[test]
 fn opens_the_book_before_anything_else() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(3));
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(3));
     s.run();
     assert_eq!(s.browser.opened_url(), Some("https://read.amazon.co.jp/?asin=B0TESTBOOK"));
 }
@@ -121,7 +240,7 @@ fn opens_the_book_before_anything_else() {
 /// 白地黒字にしてから撮る。これができないと OCR 前に反転が要る（ADR-0005 実測 6）。
 #[test]
 fn settles_the_display_settings_before_capturing() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(3).with_theme(Theme::Dark));
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(3).with_theme(Theme::Dark));
 
     s.run();
 
@@ -140,7 +259,7 @@ fn settles_the_display_settings_before_capturing() {
 fn uses_a_larger_font_for_the_ruby_preset() {
     let mut spec = spec();
     spec.display = DisplayTarget::ruby_first();
-    let mut s = Session::new(spec, FakeBrowser::with_pages(3));
+    let mut s = Capture::new(spec, FakeBrowser::with_pages(3));
 
     s.run();
 
@@ -151,7 +270,7 @@ fn uses_a_larger_font_for_the_ruby_preset() {
 /// 段が足りないリーダーでも、存在しない段を要求せずに撮影へ進む。
 #[test]
 fn copes_with_a_reader_that_has_fewer_font_steps() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(3).with_font(1, 3));
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(3).with_font(1, 3));
 
     let last = s.run();
 
@@ -167,7 +286,7 @@ fn copes_with_a_reader_that_has_fewer_font_steps() {
 /// 巻末を確定できるので、「位置」表示の書籍でも end_confirmed は真になる。
 #[test]
 fn confirms_the_end_from_the_control_that_disappears() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(12).using_locations());
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(12).using_locations());
 
     let last = s.run();
 
@@ -181,7 +300,7 @@ fn confirms_the_end_from_the_control_that_disappears() {
 #[test]
 fn finishes_without_confirming_when_the_end_cannot_be_observed() {
     let browser = FakeBrowser::with_pages(30).using_locations().reachable_pages(1, 12);
-    let mut s = Session::new(spec(), browser);
+    let mut s = Capture::new(spec(), browser);
 
     let last = s.run();
 
@@ -193,7 +312,7 @@ fn finishes_without_confirming_when_the_end_cannot_be_observed() {
 /// 位置表示を持たない書籍では、blob URL の変化でページ送りを確定させる。
 #[test]
 fn captures_a_book_without_any_position_display() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(6).without_labels());
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(6).without_labels());
 
     let last = s.run();
 
@@ -206,7 +325,7 @@ fn captures_a_book_without_any_position_display() {
 #[test]
 fn starts_capturing_where_the_rewind_stops() {
     let mut s =
-        Session::new(spec(), FakeBrowser::with_pages(30).starting_at(20).reachable_pages(5, 30));
+        Capture::new(spec(), FakeBrowser::with_pages(30).starting_at(20).reachable_pages(5, 30));
 
     let last = s.run();
 
@@ -216,13 +335,13 @@ fn starts_capturing_where_the_rewind_stops() {
 
 #[test]
 fn fails_when_the_settings_menu_never_opens() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(5).with_broken_menu());
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(5).with_broken_menu());
     assert_eq!(s.run(), Action::Fail(Failure::SettingsMenuUnavailable));
 }
 
 #[test]
 fn fails_when_the_book_never_renders() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(5).ready_after(u32::MAX));
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(5).ready_after(u32::MAX));
     let last = s.run();
     assert!(matches!(last, Action::Fail(Failure::BookDidNotLoad { .. })), "{last:?}");
     assert!(s.captured.is_empty());
@@ -230,7 +349,7 @@ fn fails_when_the_book_never_renders() {
 
 #[test]
 fn fails_when_pages_stop_advancing_before_the_end() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(50).that_never_turns());
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(50).that_never_turns());
     let last = s.run();
     assert!(matches!(last, Action::Fail(Failure::PageDidNotAdvance { .. })), "{last:?}");
 }
@@ -364,7 +483,7 @@ fn turning_moves_along_the_reading_direction() {
 /// 本の途中で静かに打ち切ってしまう。
 #[test]
 fn captures_everything_even_though_some_turns_are_swallowed() {
-    let mut s = Session::new(spec(), FakeBrowser::with_pages(15).using_locations());
+    let mut s = Capture::new(spec(), FakeBrowser::with_pages(15).using_locations());
 
     let last = s.run();
 
