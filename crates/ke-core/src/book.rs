@@ -109,9 +109,9 @@ mod tests {
 
     #[test]
     fn accepts_a_well_formed_asin_and_uppercases_it() {
-        let a = Asin::new("b0bqqsqt86").unwrap();
-        assert_eq!(a.as_str(), "B0BQQSQT86");
-        assert_eq!(a.reader_url(), "https://read.amazon.co.jp/?asin=B0BQQSQT86");
+        let a = Asin::new("B0TESTBOOK").unwrap();
+        assert_eq!(a.as_str(), "B0TESTBOOK");
+        assert_eq!(a.reader_url(), "https://read.amazon.co.jp/?asin=B0TESTBOOK");
     }
 
     #[test]
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let spec = BookSpec::new(Asin::new("B0BQQSQT86").unwrap(), "テスト本");
+        let spec = BookSpec::new(Asin::new("B0TESTBOOK").unwrap(), "テスト本");
         let json = serde_json::to_string(&spec).unwrap();
         let back: BookSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(spec, back);

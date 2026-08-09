@@ -220,8 +220,8 @@ PARSeq のバッチ化は将来の最適化候補として残す（PyTorch 重�
 
 ## 実験の再現手順
 
-スパイクのスクリプトは本リポジトリには含めていない（使い捨てのため）。
-再現する場合は以下を行う。
+スクリプトは [`spikes/`](../../spikes/) に置いてある（使い捨てであり CI の対象外）。
+手順の要点は以下のとおり。
 
 1. Chrome で `writing-mode: vertical-rl` + `<ruby><rt>` の HTML を
    `--headless --screenshot --force-device-scale-factor=N` でレンダリング

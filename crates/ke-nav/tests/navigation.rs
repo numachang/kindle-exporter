@@ -146,7 +146,7 @@ fn drive(nav: &mut Navigator, reader: &mut FakeReader) -> (Action, Vec<Action>) 
 }
 
 fn spec() -> BookSpec {
-    BookSpec::new(Asin::new("B0BQQSQT86").expect("固定の ASIN"), "テスト本")
+    BookSpec::new(Asin::new("B0TESTBOOK").expect("固定の ASIN"), "テスト本")
 }
 
 fn quick_limits() -> Limits {
@@ -193,7 +193,7 @@ fn opens_the_book_by_its_reader_url_first() {
     let obs = Observation::default();
     assert_eq!(
         nav.step(&obs),
-        Action::OpenBook { url: "https://read.amazon.co.jp/?asin=B0BQQSQT86".into() }
+        Action::OpenBook { url: "https://read.amazon.co.jp/?asin=B0TESTBOOK".into() }
     );
 }
 

@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn actions_round_trip_through_json() {
         let actions = vec![
-            Action::OpenBook { url: "https://read.amazon.co.jp/?asin=B0BQQSQT86".into() },
+            Action::OpenBook { url: "https://read.amazon.co.jp/?asin=B0TESTBOOK".into() },
             Action::Wait { ms: 1200, reason: WaitReason::BookLoading },
             Action::ClickFontSlider { fraction: 0.65 },
             Action::MeasurePage,
