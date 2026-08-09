@@ -163,16 +163,30 @@ fn copes_with_a_reader_that_has_fewer_font_steps() {
 // 実機で観測した書籍の癖
 // ------------------------------------------------------------------
 
-/// 「位置」表示の書籍は巻末に達しても総数に届かない（ADR-0007 実測 5）。
-/// 撮り切ったのに失敗として捨ててはいけない。
+/// 巻末では送りの操作子が消える（ADR-0007 実測 11）。位置表示の形式に依存せず
+/// 巻末を確定できるので、「位置」表示の書籍でも end_confirmed は真になる。
 #[test]
-fn finishes_a_location_style_book_without_confirming_the_end() {
+fn confirms_the_end_from_the_control_that_disappears() {
     let mut s = Session::new(spec(), FakeBrowser::with_pages(12).using_locations());
 
     let last = s.run();
 
     let Action::Done(summary) = last else { panic!("失敗にしてはいけない: {last:?}") };
-    assert!(!summary.end_confirmed, "巻末を確定したと言ってはいけない");
+    assert!(summary.end_confirmed, "操作子が消えたのだから巻末と確定できる");
+    assert_eq!(s.captured.len(), 12);
+}
+
+/// 操作子が消えないまま送りが止まった場合は、巻末なのか故障なのか分からない。
+/// 「位置」表示の書籍では区別できないので、確定せずに終える。
+#[test]
+fn finishes_without_confirming_when_the_end_cannot_be_observed() {
+    let browser = FakeBrowser::with_pages(30).using_locations().reachable_pages(1, 12);
+    let mut s = Session::new(spec(), browser);
+
+    let last = s.run();
+
+    let Action::Done(summary) = last else { panic!("失敗にしてはいけない: {last:?}") };
+    assert!(!summary.end_confirmed, "確定できないものを確定したと言ってはいけない");
     assert_eq!(s.captured.len(), 12);
 }
 

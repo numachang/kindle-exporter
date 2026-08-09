@@ -46,6 +46,8 @@ cargo run -p ke-cdp --example probe -- turn 20
   こちらの typo ではない。直すと動かなくなる
 - **`element.click()` は効かない要素がある。** `Input.dispatchMouseEvent` に統一する
 - **ページ送りには約 100ms の最小間隔がある。** 短いと黙って無視される（ADR-0007 実測 8）
+- **chevron は矩形が 0 でも DOM には居る。** 端では DOM から消える。
+  端の判定は存在の有無で行う。押すときは先にポインタをその側へ動かす（ADR-0007 実測 11）
 - 設定メニューの開閉判定は `ion-menu` の `classList.contains('show-menu')`。
   `ion-backdrop` は出ないので当てにしてはいけない
 - `ion-range` の `value` は **JS プロパティとしては読めないが属性としては読める**。
@@ -67,8 +69,14 @@ Chrome を専用プロファイルで、リモートデバッグを有効にし�
   --remote-allow-origins=* `
   --user-data-dir="$env:USERPROFILE\.ke-chrome-profile" `
   --no-first-run --no-default-browser-check `
+  --disable-backgrounding-occluded-windows `
+  --disable-renderer-backgrounding `
+  --disable-background-timer-throttling `
   "https://read.amazon.co.jp/?asin=<ASIN>"
 ```
+
+**下 3 つのフラグは必須。** 無いとウィンドウが隠れた瞬間に Chrome が
+レンダラを絞り、ページ送りが 1.8 秒/頁に落ちてやがて止まる（ADR-0007 実測 10）。
 
 初回は Amazon へのログインが必要（以降このプロファイルに残る）。
 本を開いた状態にしてから実行する。

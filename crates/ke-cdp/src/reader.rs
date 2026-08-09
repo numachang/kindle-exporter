@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use ke_core::{FontControl, Observation, PageImageInfo, PageLabel, Theme};
+use ke_core::{FontControl, Observation, PageImageInfo, PageLabel, Theme, TurnControls};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -19,6 +19,11 @@ const FONT_PRESS_LIMIT: u8 = 64;
 const FONT_SETTLE: Duration = Duration::from_millis(1_200);
 /// 属性のポーリング間隔。
 const POLL: Duration = Duration::from_millis(20);
+/// ポインタを動かしてから chevron が描かれるまでの待ち。
+const HOVER_SETTLE: Duration = Duration::from_millis(150);
+/// chevron を出させるために動かす位置（viewport に対する割合）。実測 5% / 95% / 50%。
+const HOVER_SIDES: [f64; 2] = [0.05, 0.95];
+const HOVER_MIDDLE: f64 = 0.5;
 
 /// CDP 経由で実機のリーダーを操作する。
 #[derive(Debug)]
@@ -49,6 +54,8 @@ struct RawObservation {
     settings_menu_open: bool,
     font: Option<FontControl>,
     theme: Option<String>,
+    #[serde(default)]
+    chevrons: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +73,31 @@ struct RawButton {
     aria: String,
     x: f64,
     y: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChevron {
+    aria: String,
+    x: f64,
+    y: f64,
+    visible: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChevrons {
+    list: Vec<RawChevron>,
+    viewport: (f64, f64),
+}
+
+/// 送りの操作子がいまどうなっているか。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Chevron {
+    /// DOM から消えている＝その方向へは進めない（＝端にいる）。
+    Missing,
+    /// DOM にはあるが描かれていない。ポインタを近づければ出る。
+    Hidden,
+    /// 押せる位置にある。
+    At(f64, f64),
 }
 
 impl CdpBrowser {
@@ -173,6 +205,26 @@ impl CdpBrowser {
         }
     }
 
+    /// 指定方向の chevron がいまどうなっているか。
+    fn chevron(&mut self, labels: &[&str]) -> Result<(Chevron, (f64, f64))> {
+        let found: RawChevrons = self.eval(js::CHEVRONS, false)?;
+        let hit = found.list.iter().find(|c| labels.contains(&c.aria.as_str()));
+        let state = match hit {
+            None => Chevron::Missing,
+            Some(c) if c.visible => Chevron::At(c.x, c.y),
+            Some(_) => Chevron::Hidden,
+        };
+        Ok((state, found.viewport))
+    }
+
+    /// ポインタを動かして、隠れている chevron を出させる。
+    fn hover(&mut self, x: f64, y: f64) -> Result<()> {
+        self.cdp
+            .send("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }))?;
+        sleep(HOVER_SETTLE);
+        Ok(())
+    }
+
     /// フォントサイズの現在段。設定メニューが閉じていれば `None`。
     fn font(&mut self) -> Result<Option<FontControl>> {
         self.eval(&js::font_only(), false)
@@ -219,6 +271,7 @@ impl Browser for CdpBrowser {
             settings_menu_open: raw.settings_menu_open,
             font: raw.font,
             theme: raw.theme.as_deref().and_then(parse_theme),
+            turn_controls: turn_controls(&raw.chevrons),
             // 画素/文字は OCR を持つ上位層が測る。ここでは分からない。
             metrics: None,
         })
@@ -270,11 +323,33 @@ impl Browser for CdpBrowser {
         })
     }
 
+    /// ページを送る。
+    ///
+    /// リーダーは**ポインタのある側の chevron しか描かない**（ADR-0007 実測 11）。
+    /// 描かれていなければ左右にポインタを動かして出させる。
+    /// **DOM から消えている場合は端にいる**ので、探し回らずに失敗させる。
     fn turn_page(&mut self, direction: Direction) -> Result<()> {
-        match direction {
-            Direction::Next => self.click_labelled(js::NEXT_LABELS, "「次のページ」ボタン"),
-            Direction::Prev => self.click_labelled(js::PREV_LABELS, "「前のページ」ボタン"),
+        let (labels, what) = match direction {
+            Direction::Next => (js::NEXT_LABELS, "「次のページ」ボタン"),
+            Direction::Prev => (js::PREV_LABELS, "「前のページ」ボタン"),
+        };
+        let (state, viewport) = self.chevron(labels)?;
+        match state {
+            Chevron::At(x, y) => return self.click_at(x, y),
+            Chevron::Missing => {
+                return Err(Error::not_found(what, ["端に達しています".to_owned()]));
+            }
+            Chevron::Hidden => {}
         }
+        // どちら側にあるかは矩形が無いと分からないので、両側を試す。
+        for ratio in HOVER_SIDES {
+            let (x, y) = (viewport.0 * ratio, viewport.1 * HOVER_MIDDLE);
+            self.hover(x, y)?;
+            if let (Chevron::At(cx, cy), _) = self.chevron(labels)? {
+                return self.click_at(cx, cy);
+            }
+        }
+        Err(Error::not_found(what, ["DOM にはあるが描かれていません".to_owned()]))
     }
 
     fn capture_page(&mut self) -> Result<PageImage> {
@@ -301,6 +376,20 @@ impl Browser for CdpBrowser {
     }
 }
 
+/// chevron の**存在**から、どちらへ動けるかを読む（ADR-0007 実測 11）。
+///
+/// **巻末では「次のページ」が、先頭では「前のページ」が DOM から消える。**
+/// 描かれているかどうかは見ない — ポインタが反対側にあるだけで矩形は 0 になり、
+/// それを端と取り違えると本の途中で撮影を終えてしまう。
+/// 1 つも無ければ本がまだ描画されていないので `None`（判断しない）。
+fn turn_controls(chevrons: &[String]) -> Option<TurnControls> {
+    if chevrons.is_empty() {
+        return None;
+    }
+    let has = |labels: &[&str]| chevrons.iter().any(|c| labels.contains(&c.as_str()));
+    Some(TurnControls { next: has(js::NEXT_LABELS), prev: has(js::PREV_LABELS) })
+}
+
 /// リーダーが返すテーマ名を型に落とす。
 ///
 /// 設定メニューの radio は `White` / `Dark` / `Sepia` / `Green` を返し、
@@ -321,6 +410,17 @@ mod tests {
 
     /// 明色テーマの class 名は `--white` ではない。ここを取り違えると
     /// テーマが正しいのに何度も設定し直すことになる。
+    /// 巻末・先頭の判定は chevron の有無で行う。
+    #[test]
+    fn reads_which_way_the_reader_can_still_turn() {
+        let both = ["次のページ".to_owned(), "前のページ".to_owned()];
+        assert_eq!(turn_controls(&both), Some(TurnControls::both()));
+        assert_eq!(turn_controls(&both[1..]), Some(TurnControls::at_end()));
+        assert_eq!(turn_controls(&both[..1]), Some(TurnControls::at_start()));
+        // 本がまだ描画されていない。端だと決めつけない。
+        assert_eq!(turn_controls(&[]), None);
+    }
+
     #[test]
     fn reads_the_light_theme_under_both_of_its_names() {
         assert_eq!(parse_theme("White"), Some(Theme::White));

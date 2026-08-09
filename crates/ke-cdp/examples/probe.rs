@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use ke_cdp::{Browser, CdpBrowser, Direction};
 use ke_core::{Observation, Theme};
 
-/// ページ送りの確定を待つ上限（ADR-0007 実測 6 の最大は 1.2 秒）。
-const TURN_TIMEOUT: Duration = Duration::from_secs(4);
+/// ページ送りの確定を待つ上限。`ke-nav` の `page_turn_timeout_ms` と同じ値にする。
+const TURN_TIMEOUT: Duration = Duration::from_secs(8);
 /// 表示設定を変えたあと、ページが作り直されるのを待つ上限。
 const RENDER_TIMEOUT: Duration = Duration::from_secs(20);
 /// 観測の間隔。
@@ -61,6 +61,16 @@ fn show(obs: &Observation) {
         ),
         None => println!("画像    : (なし)"),
     }
+    // 巻末では「次」が、先頭では「前」が消える（ADR-0007 実測 11）。
+    println!(
+        "送り    : {}{}{}",
+        match obs.turn_controls {
+            Some(c) => format!("次={} 前={}", c.next, c.prev),
+            None => "(観測できず)".to_owned(),
+        },
+        if obs.at_start_of_book() { "  ← 先頭" } else { "" },
+        if obs.at_end_of_book() { "  ← 巻末" } else { "" },
+    );
     println!("メニュー: {}", if obs.settings_menu_open { "開いている" } else { "閉じている" });
     println!("フォント: {:?}", obs.font);
     println!("テーマ  : {:?}", obs.theme);

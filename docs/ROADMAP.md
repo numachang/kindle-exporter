@@ -21,29 +21,13 @@
 実機で観測・取得・表示設定・ページ送りがすべて通ることを確認済み
 （`cargo run -p ke-cdp --example probe`）。
 
-**ただし 1 冊を通して撮れることはまだ確認できていない。**
-約 200 ページ送り続けたところでリーダーが応答しなくなった（ADR-0007 実測 10）。
-これが次の最優先課題である。
+巻末・先頭の検出、ページ送り、表示設定、ページ画像の取得はすべて実機で通っている。
+**ただし先頭から巻末まで一気に撮り切る経路はまだ通していない**（1 の record/replay と
+`ke-workflow` が要る）。
 
----
-
-## 0. リーダーの長時間稼働（**最優先。これが解けないと 1 冊も完走できない**）
-
-ADR-0007 実測 10。約 200 ページを 300ms 間隔で送り続けると、
-1 ページ 1.0 秒に劣化したのち、**ページ画像も UI ボタンも DOM から消えた状態**になる。
-リロードしても数分は回復しない。
-
-測ること:
-
-1. 何ページ目・何分目から劣化が始まるか（間隔を変えて）
-2. リロードで回復するまでの時間
-3. 送りの間隔を広げれば避けられるか（500ms / 1s）
-4. N ページごとにタブをリロードして続きから再開できるか
-5. blob URL を明示的に `URL.revokeObjectURL` すると変わるか
-
-`ke-cdp` の `examples/probe.rs` に `turn` があるので、ページ数を増やすだけで測れる。
-**結果は必ず ADR に残すこと。** 対策は `ke-workflow` の設計（1 冊を分割して
-再開する単位）に直結する。
+> **Chrome の起動フラグが必須。** `--disable-backgrounding-occluded-windows` 等を
+> 付けないと、ウィンドウを最小化・被覆した時点で capture が実質停止する
+> （ADR-0007 実測 10）。手順は下記「環境の再構築」。
 
 ---
 
@@ -174,7 +158,7 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 
 | # | 内容 | 影響 |
 |---|---|---|
-| 1 | **リーダーの長時間稼働**（上記 0） | **1 冊を完走できるかどうか。最優先** |
+| 1 | **1 冊の完走**。先頭から巻末まで一気に撮り切る経路 | ここまで来ないと所要時間の総計が出ない |
 | 2 | **フォント段と画素/文字の対応表**。ADR-0005 は割合で測っており段番号では測っていない | 既定の目標段が決まらない。OCR 環境の再構築が要る |
 | 3 | `sideMarginsSize` / `maxNumberColumns` を UI から変えた効果。操作子は `#narrow` / `#medium` / `#wide` と特定済み | 同じフォントサイズでより多くの文字が入る可能性 |
 | 4 | マンガ（固定レイアウト）でも同じ `kg-full-page-img` 経路か | 経路分岐が要るかどうか |
@@ -192,7 +176,21 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 Amazon にログイン済みの専用プロファイルが要る。
 **Chrome 136 以降は既定プロファイルだと `--remote-debugging-port` が無視される**ため、
 `--user-data-dir` の指定が必須。置き場所は temp ではなく永続的な場所にする
-（例: `~/.ke-chrome-profile`）。起動手順は [spikes/README.md](../spikes/README.md)。
+（例: `~/.ke-chrome-profile`）。
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 --remote-allow-origins=* `
+  --user-data-dir="$env:USERPROFILE\.ke-chrome-profile" `
+  --no-first-run --no-default-browser-check `
+  --disable-backgrounding-occluded-windows `
+  --disable-renderer-backgrounding `
+  --disable-background-timer-throttling `
+  "https://read.amazon.co.jp/"
+```
+
+**下 3 つのフラグは必須。** 無いと、ウィンドウが隠れた瞬間に Chrome が
+レンダラを絞り、1 ページ 1.8 秒に落ちてやがて止まる（ADR-0007 実測 10）。
 
 ### Python 環境
 
@@ -212,7 +210,9 @@ GPU を使う場合の NVIDIA ランタイム（`os.add_dll_directory` が必要
 
 | 項目 | 値 | 出典 |
 |---|---|---|
-| **ページ送り + 取得（`ke-cdp` 経由）** | **約 300ms/頁** | ADR-0007 影響 |
+| **ページ送り + 取得（`ke-cdp` 経由）** | **194〜321ms/頁**（最小化しても同じ） | ADR-0007 実測 10 |
+| 巻末・先頭の確定シグナル | chevron が **DOM から消える**（矩形 0 は「隠れている」だけ） | ADR-0007 実測 11 |
+| Chrome の絞り込み無効フラグ | **必須**。無いと隠れた瞬間に 1.8 秒/頁へ | ADR-0007 実測 10 |
 | **送りの最小間隔** | **100ms。これより短いと黙って無視される** | ADR-0007 実測 8 |
 | 押し直しまでの最適値 | 400ms | ADR-0007 実測 8 |
 | 観測（`Runtime.evaluate`）の下限間隔 | 20ms。詰めるとページが遅くなる | ADR-0007 実測 9 |

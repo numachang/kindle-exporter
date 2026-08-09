@@ -11,7 +11,7 @@
 
 use ke_core::{
     Action, Asin, BookSpec, DisplayTarget, Failure, FontControl, Observation, PageImageInfo,
-    PageLabel, PageMetrics, Theme,
+    PageLabel, PageMetrics, Theme, TurnControls,
 };
 use ke_nav::{Limits, Navigator};
 
@@ -66,6 +66,8 @@ struct FakeReader {
     stop_at: Option<u32>,
     /// 位置表示を持つか。
     has_label: bool,
+    /// 端で送りの操作子が消えるか（ADR-0007 実測 11。実機はこう振る舞う）。
+    hides_end_controls: bool,
     /// 位置表示が「ページ」ではなく Kindle の「位置」か（ADR-0007 実測 5）。
     locations: bool,
     /// 表示設定を変えたあと、ページ画像が消えている観測回数（ADR-0007 実測 8）。
@@ -95,6 +97,7 @@ impl FakeReader {
             min_page: 1,
             stop_at: None,
             has_label: true,
+            hides_end_controls: true,
             locations: false,
             rerender_ticks: 0,
             rerender_left: 0,
@@ -102,6 +105,16 @@ impl FakeReader {
             swallowed: false,
             captured: Vec::new(),
         }
+    }
+
+    /// 実機は巻末で「次のページ」、先頭で「前のページ」を DOM から消す。
+    fn turn_controls(&self) -> Option<TurnControls> {
+        if !self.hides_end_controls {
+            return Some(TurnControls::both());
+        }
+        // 操作子が消えるのは**本当の端**だけ。`stop_at` / `min_page` は
+        // 「操作子はあるのに動かない」という故障を表すので、ここには反映しない。
+        Some(TurnControls { next: self.page < self.total.unwrap_or(u32::MAX), prev: self.page > 1 })
     }
 
     fn label(&self) -> PageLabel {
@@ -127,6 +140,7 @@ impl FakeReader {
             settings_menu_open: self.menu_open,
             font: self.menu_open.then(|| FontControl::new(self.font_index, self.font_max)),
             theme: self.theme,
+            turn_controls: loaded.then(|| self.turn_controls()).flatten(),
             metrics: self.take_metrics(),
         }
     }

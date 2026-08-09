@@ -26,6 +26,6 @@ mod phase;
 pub use action::{Action, Failure, Summary, WaitReason};
 pub use book::{Asin, AsinError, BookSpec};
 pub use display::{DisplayTarget, FontControl, Theme};
-pub use observation::Observation;
+pub use observation::{Observation, TurnControls};
 pub use page::{LabelKind, PageImageInfo, PageLabel, PageMetrics};
 pub use phase::{ALL_PHASES, Capability, Phase};

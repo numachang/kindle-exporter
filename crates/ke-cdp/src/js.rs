@@ -82,12 +82,20 @@ pub const OBSERVE: &str = r##"
     return m ? m[1] : null;
   })();
 
+  // 巻末では「次のページ」、先頭では「前のページ」が **DOM から消える**。
+  // 一方、ポインタが反対側にあるだけの場合は DOM に残って矩形が 0 になる。
+  // 端の判定は**存在するかどうか**で行う（ADR-0007 実測 11）。
+  const chevrons = [...document.querySelectorAll('button')]
+    .filter((b) => (b.id || '').startsWith('kr-chevron'))
+    .map((b) => b.getAttribute('aria-label'));
+
   return JSON.stringify({
     label,
     image,
     settingsMenuOpen: !!menu && menu.classList.contains('show-menu'),
     font: FONT,
     theme,
+    chevrons,
   });
 })()
 "##;
@@ -150,6 +158,24 @@ pub const CAPTURE: &str = r##"
     height: img.naturalHeight,
     source: img.currentSrc || img.src || null,
   });
+})()
+"##;
+
+/// ページ送りの chevron を、存在と矩形の両方つきで列挙する。
+///
+/// **存在するのに矩形が 0 のことがある。** リーダーはポインタのある側の
+/// chevron しか描画しない（ADR-0007 実測 11）。押すには先に反対側へ
+/// ポインタを動かして出させる必要がある。
+pub const CHEVRONS: &str = r##"
+(() => {
+  const list = [...document.querySelectorAll('button')]
+    .filter((b) => (b.id || '').startsWith('kr-chevron'))
+    .map((b) => {
+      const r = b.getBoundingClientRect();
+      return { aria: b.getAttribute('aria-label'), x: r.x + r.width / 2, y: r.y + r.height / 2,
+               visible: r.width > 0 && r.height > 0 };
+    });
+  return JSON.stringify({ list, viewport: [innerWidth, innerHeight] });
 })()
 "##;
 

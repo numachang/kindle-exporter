@@ -9,7 +9,7 @@
 //! 「位置」で表示する書籍、先頭に戻れない書籍、送りが効かない書籍 —
 //! どれも実機で起きうるので、ここで再現できなければテストの意味がない。
 
-use ke_core::{FontControl, Observation, PageImageInfo, PageLabel, Theme};
+use ke_core::{FontControl, Observation, PageImageInfo, PageLabel, Theme, TurnControls};
 
 use crate::error::{Error, Result};
 use crate::{Browser, Direction, PageImage};
@@ -222,6 +222,13 @@ impl FakeBrowser {
         }
     }
 
+    /// 実機は巻末で「次のページ」、先頭で「前のページ」を DOM から消す
+    /// （ADR-0007 実測 11）。消えるのは**本当の端**だけで、
+    /// `reachable_pages` や `that_never_turns` の故障では消えない。
+    fn turn_controls(&self) -> TurnControls {
+        TurnControls { next: self.at < self.pages, prev: self.at > 1 }
+    }
+
     fn require_menu(&self, what: &'static str) -> Result<()> {
         if self.menu_open {
             return Ok(());
@@ -252,6 +259,7 @@ impl Browser for FakeBrowser {
             settings_menu_open: self.menu_open,
             font: self.menu_open.then_some(self.font),
             theme: Some(self.theme),
+            turn_controls: ready.then(|| self.turn_controls()),
             // 画素/文字は OCR を持つ上位層が測る。実機と同じく None。
             metrics: None,
         })

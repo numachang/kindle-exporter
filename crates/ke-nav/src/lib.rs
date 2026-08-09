@@ -310,7 +310,7 @@ impl Navigator {
     }
 
     fn start_rewind(&self, obs: &Observation) -> (Action, State) {
-        if obs.page.as_ref().is_some_and(PageLabel::is_first) {
+        if self.is_at_start(obs) {
             return (self.capture_here(obs), State::Capturing);
         }
         let from = Box::new(obs.clone());
@@ -320,6 +320,14 @@ impl Navigator {
 
 /// 巻き戻しと撮影。
 impl Navigator {
+    /// 先頭にいると言えるか。
+    ///
+    /// **戻しの操作子が消えていることが最も確実**である（ADR-0007 実測 11）。
+    /// 位置表示しか無い場合はそれで代用する。
+    fn is_at_start(&self, obs: &Observation) -> bool {
+        obs.at_start_of_book() || obs.page.as_ref().is_some_and(PageLabel::is_first)
+    }
+
     fn on_rewinding(
         &self,
         obs: &Observation,
@@ -327,7 +335,7 @@ impl Navigator {
         stalls: u8,
         from: &Observation,
     ) -> (Action, State) {
-        if obs.page.as_ref().is_some_and(PageLabel::is_first) {
+        if self.is_at_start(obs) {
             return (self.capture_here(obs), State::Capturing);
         }
         let stalls = if obs.advanced_from(from) { 0 } else { stalls.saturating_add(1) };
@@ -360,7 +368,10 @@ impl Navigator {
         if self.captured >= self.limits.max_pages {
             return (fail(Failure::TooManyPages { limit: self.limits.max_pages }), State::Ended);
         }
-        if obs.page.as_ref().is_some_and(PageLabel::is_last) {
+        // 巻末では送りの操作子そのものが消える（ADR-0007 実測 11）。
+        // ここで気づかずに送ろうとすると、完了ではなく「操作子が無い」という
+        // 失敗になってしまう。
+        if obs.at_end_of_book() || obs.page.as_ref().is_some_and(PageLabel::is_last) {
             return (self.finish(true), State::Ended);
         }
         let next = State::PageTurning { from: Box::new(obs.clone()), waited_ms: 0, presses: 1 };
@@ -405,6 +416,9 @@ impl Navigator {
     /// 打ち切って `end_confirmed: false` を立て、後段に判断を委ねる。
     /// ここを取り違えると、全ページ撮り終えた書籍を失敗として捨ててしまう。
     fn on_stall(&self, from: &Observation) -> (Action, State) {
+        if from.at_end_of_book() {
+            return (self.finish(true), State::Ended);
+        }
         match from.page.as_ref() {
             Some(p) if p.is_last() => (self.finish(true), State::Ended),
             Some(p) if p.can_confirm_end() => {
