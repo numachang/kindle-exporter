@@ -34,6 +34,8 @@ pub struct Limits {
     pub book_load_timeout_ms: u64,
     /// ページ送りの反映を待つ上限（ミリ秒）。
     pub page_turn_timeout_ms: u64,
+    /// 表示設定を変えたあと、ページが作り直されるのを待つ上限（ミリ秒）。
+    pub render_timeout_ms: u64,
     /// 設定メニューの開閉を試みる回数。
     pub menu_attempts: u8,
     /// 巻き戻しで「位置が変わらない」を何回連続したら先頭とみなすか。
@@ -49,8 +51,12 @@ impl Default for Limits {
         Self {
             book_load_timeout_ms: 45_000,
             page_turn_timeout_ms: 8_000,
+            // 実測 2.8 秒（ADR-0007 実測 8）。遅い機械のために余裕を取る。
+            render_timeout_ms: 20_000,
             menu_attempts: 3,
-            rewind_stall_threshold: 2,
+            // 送りは空振りしうるので、2 回では「先頭に着いた」と誤認する
+            // （ADR-0007 実測 9）。誤認すると本の途中から撮り始めてしまう。
+            rewind_stall_threshold: 3,
             max_rewind_presses: 2_000,
             max_pages: 5_000,
         }
@@ -61,7 +67,19 @@ impl Default for Limits {
 const WAIT_LOAD_MS: u32 = 1_000;
 const WAIT_MENU_MS: u32 = 600;
 const WAIT_APPLY_MS: u32 = 1_500;
-const WAIT_TURN_MS: u32 = 250;
+/// ページ送りが反映されたかを見る間隔。細かく見るほど 1 ページが速くなる。
+const WAIT_TURN_MS: u32 = 60;
+/// 巻き戻しで次を押すまでの間隔。
+///
+/// **ページ送りのクリックには約 100ms の最小間隔がある**（ADR-0007 実測 9）。
+/// これより短く押すと無視される。巻き戻しは毎回押すので、ここで間隔を確保する。
+const WAIT_REWIND_MS: u32 = 150;
+/// 位置が動かなくなったあと、巻末・巻頭と判断する前に置く間隔。
+///
+/// 空振りを「動かなくなった」と誤認しないよう、疑わしいときほど長く待つ。
+const WAIT_STALL_MS: u32 = 800;
+/// 送ったのに反映されないとき、空振りとみなして押し直すまでの時間。
+const TURN_RETRY_MS: u64 = 400;
 
 #[derive(Debug, Clone, PartialEq)]
 enum State {
@@ -73,11 +91,12 @@ enum State {
     FontWait,
     MenuClosing { attempts: u8 },
     MenuCloseWait { attempts: u8 },
+    AwaitingRender { waited_ms: u64 },
     Measuring,
     Rewinding { presses: u32, stalls: u8, from: Box<Observation> },
     RewindWait { presses: u32, stalls: u8, from: Box<Observation> },
     Capturing,
-    PageTurning { from: Box<Observation>, waited_ms: u64 },
+    PageTurning { from: Box<Observation>, waited_ms: u64, presses: u8 },
     Ended,
 }
 
@@ -185,16 +204,20 @@ impl Navigator {
             State::MenuCloseWait { attempts } => {
                 (wait(WAIT_MENU_MS, WaitReason::SettingsMenu), State::MenuClosing { attempts })
             }
+            State::AwaitingRender { waited_ms } => self.on_awaiting_render(obs, waited_ms),
             State::Measuring => self.on_measuring(obs),
             State::Rewinding { presses, stalls, from } => {
                 self.on_rewinding(obs, presses, stalls, &from)
             }
-            State::RewindWait { presses, stalls, from } => (
-                wait(WAIT_TURN_MS, WaitReason::PageTurn),
-                State::Rewinding { presses, stalls, from },
-            ),
+            State::RewindWait { presses, stalls, from } => {
+                // 一度でも動かなかったら、次はしっかり間を置いてから押す。
+                let ms = if stalls > 0 { WAIT_STALL_MS } else { WAIT_REWIND_MS };
+                (wait(ms, WaitReason::PageTurn), State::Rewinding { presses, stalls, from })
+            }
             State::Capturing => self.on_capturing(obs),
-            State::PageTurning { from, waited_ms } => self.on_page_turning(obs, &from, waited_ms),
+            State::PageTurning { from, waited_ms, presses } => {
+                self.on_page_turning(obs, &from, waited_ms, presses)
+            }
             _ => (self.finish(false), State::Ended),
         }
     }
@@ -239,12 +262,29 @@ impl Navigator {
 
     fn on_menu_closing(&self, obs: &Observation, attempts: u8) -> (Action, State) {
         if !obs.settings_menu_open {
-            return (Action::MeasurePage, State::Measuring);
+            return self.on_awaiting_render(obs, 0);
         }
         if attempts >= self.limits.menu_attempts {
             return (fail(Failure::SettingsMenuUnavailable), State::Ended);
         }
         (Action::CloseSettingsMenu, State::MenuCloseWait { attempts: attempts.saturating_add(1) })
+    }
+
+    /// 表示設定を変えるとページが**作り直され、ページ画像が DOM から消える**
+    /// （ADR-0007 実測 8 で 2.8 秒）。戻る前に測ると「画像が無い」で落ちるので、
+    /// 再描画を待ってから実測に入る。
+    fn on_awaiting_render(&self, obs: &Observation, waited_ms: u64) -> (Action, State) {
+        if obs.has_usable_image() {
+            return (Action::MeasurePage, State::Measuring);
+        }
+        let waited = waited_ms.saturating_add(obs.elapsed_ms);
+        if waited >= self.limits.render_timeout_ms {
+            return (fail(Failure::PageDidNotRender { waited_ms: waited }), State::Ended);
+        }
+        (
+            wait(WAIT_APPLY_MS, WaitReason::SettingsApplied),
+            State::AwaitingRender { waited_ms: waited },
+        )
     }
 
     fn on_measuring(&mut self, obs: &Observation) -> (Action, State) {
@@ -323,24 +363,39 @@ impl Navigator {
         if obs.page.as_ref().is_some_and(PageLabel::is_last) {
             return (self.finish(true), State::Ended);
         }
-        (Action::PressNext, State::PageTurning { from: Box::new(obs.clone()), waited_ms: 0 })
+        let next = State::PageTurning { from: Box::new(obs.clone()), waited_ms: 0, presses: 1 };
+        (Action::PressNext, next)
     }
 
+    /// ページ送りの反映待ち。
+    ///
+    /// **送りは一定の割合で空振りする**（ADR-0007 実測 9。クリックの間隔が
+    /// 約 100ms より短いと無視される）。反映されないまま待ち続けると、
+    /// 「位置」表示の書籍では巻末と誤認して本の途中で打ち切ってしまう。
+    /// そうならないよう、一定時間ごとに押し直す。
     fn on_page_turning(
         &mut self,
         obs: &Observation,
         from: &Observation,
         waited_ms: u64,
+        presses: u8,
     ) -> (Action, State) {
         if obs.advanced_from(from) && obs.has_usable_image() {
             return (self.capture_here(obs), State::Capturing);
         }
         let waited = waited_ms.saturating_add(obs.elapsed_ms);
-        if waited < self.limits.page_turn_timeout_ms {
-            let next = State::PageTurning { from: Box::new(from.clone()), waited_ms: waited };
-            return (wait(WAIT_TURN_MS, WaitReason::PageTurn), next);
+        if waited >= self.limits.page_turn_timeout_ms {
+            return self.on_stall(from);
         }
-        self.on_stall(from)
+        let staying = |presses| State::PageTurning {
+            from: Box::new(from.clone()),
+            waited_ms: waited,
+            presses,
+        };
+        if waited >= u64::from(presses) * TURN_RETRY_MS {
+            return (Action::PressNext, staying(presses.saturating_add(1)));
+        }
+        (wait(WAIT_TURN_MS, WaitReason::PageTurn), staying(presses))
     }
 
     /// ページが進まなくなったときの扱い。

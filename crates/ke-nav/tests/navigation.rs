@@ -68,6 +68,12 @@ struct FakeReader {
     has_label: bool,
     /// 位置表示が「ページ」ではなく Kindle の「位置」か（ADR-0007 実測 5）。
     locations: bool,
+    /// 表示設定を変えたあと、ページ画像が消えている観測回数（ADR-0007 実測 8）。
+    rerender_ticks: u32,
+    rerender_left: u32,
+    /// ページ送りを 1 回おきに無視する（ADR-0007 実測 9 の最悪ケース）。
+    swallows_turns: bool,
+    swallowed: bool,
     captured: Vec<PageLabel>,
 }
 
@@ -90,6 +96,10 @@ impl FakeReader {
             stop_at: None,
             has_label: true,
             locations: false,
+            rerender_ticks: 0,
+            rerender_left: 0,
+            swallows_turns: false,
+            swallowed: false,
             captured: Vec::new(),
         }
     }
@@ -104,7 +114,10 @@ impl FakeReader {
 
     fn observe(&mut self) -> Observation {
         self.ticks += 1;
-        let loaded = self.ticks > self.load_ticks;
+        // 表示設定を変えるとページが作り直され、その間は画像も位置表示も消える。
+        let rendering = self.rerender_left > 0;
+        self.rerender_left = self.rerender_left.saturating_sub(1);
+        let loaded = self.ticks > self.load_ticks && !rendering;
         Observation {
             elapsed_ms: 1_000,
             page: (loaded && self.has_label).then(|| self.label()),
@@ -129,8 +142,14 @@ impl FakeReader {
         match action {
             Action::OpenSettingsMenu if self.menu_operable => self.menu_open = true,
             Action::CloseSettingsMenu if self.menu_operable => self.menu_open = false,
-            Action::SetTheme(t) => self.theme = Some(*t),
-            Action::SetFontSize { index } => self.font_index = (*index).min(self.font_max),
+            Action::SetTheme(t) if self.theme != Some(*t) => {
+                self.theme = Some(*t);
+                self.rerender_left = self.rerender_ticks;
+            }
+            Action::SetFontSize { index } if self.font_index != (*index).min(self.font_max) => {
+                self.font_index = (*index).min(self.font_max);
+                self.rerender_left = self.rerender_ticks;
+            }
             Action::MeasurePage => self.emit_metrics = true,
             Action::CapturePage { label } => self.captured.push(label.clone()),
             Action::PressNext => self.turn(1),
@@ -142,6 +161,12 @@ impl FakeReader {
     fn turn(&mut self, delta: i64) {
         if !self.can_advance {
             return;
+        }
+        if self.swallows_turns {
+            self.swallowed = !self.swallowed;
+            if self.swallowed {
+                return;
+            }
         }
         let next = i64::from(self.page) + delta;
         let hi = self.stop_at.or(self.total).map_or(i64::MAX, i64::from);
@@ -352,6 +377,70 @@ fn fails_when_the_book_never_loads() {
         "{last:?}"
     );
     assert_eq!(count(&log, |a| matches!(a, Action::CapturePage { .. })), 0);
+}
+
+/// ページ送りは一定の割合で空振りする（ADR-0007 実測 9）。押し直さないと、
+/// 「位置」表示の書籍では巻末と誤認して本の途中で静かに打ち切ってしまう。
+#[test]
+fn presses_again_when_a_page_turn_is_swallowed() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 12);
+    reader.swallows_turns = true;
+
+    let (last, log) = drive(&mut nav, &mut reader);
+
+    assert!(matches!(last, Action::Done(_)), "{last:?}");
+    assert_eq!(reader.captured.len(), 12, "空振りしても全ページ撮り切る");
+    assert!(
+        count(&log, |a| matches!(a, Action::PressNext)) > 12,
+        "空振りしたぶん押し直しているはず"
+    );
+}
+
+/// 空振りが続いても「先頭に着いた」と誤認して本の途中から撮り始めない。
+#[test]
+fn a_swallowed_press_is_not_mistaken_for_the_start_of_the_book() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(8, 12);
+    reader.swallows_turns = true;
+
+    drive(&mut nav, &mut reader);
+
+    assert_eq!(reader.captured.first(), Some(&PageLabel::new(1, Some(12))), "先頭から撮る");
+}
+
+/// 表示設定を変えるとページが作り直され、しばらくページ画像が消える
+/// （ADR-0007 実測 8 で 2.8 秒）。戻る前に実測しようとすると実機で落ちる。
+#[test]
+fn waits_for_the_page_to_be_rebuilt_after_changing_settings() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 4);
+    reader.rerender_ticks = 4;
+
+    let (last, log) = drive(&mut nav, &mut reader);
+
+    assert!(matches!(last, Action::Done(_)), "{last:?}");
+    assert_eq!(reader.captured.len(), 4);
+    // 画像が戻る前に測ろうとしていない
+    let measure_at = log.iter().position(|a| matches!(a, Action::MeasurePage));
+    let font_at = log.iter().position(|a| matches!(a, Action::SetFontSize { .. }));
+    assert!(measure_at > font_at, "設定より前に測っている: {measure_at:?} {font_at:?}");
+}
+
+#[test]
+fn fails_when_the_page_never_comes_back_after_a_settings_change() {
+    let limits = Limits { render_timeout_ms: 3_000, ..quick_limits() };
+    let mut nav = Navigator::with_limits(spec(), limits);
+    let mut reader = FakeReader::new(1, 4);
+    reader.rerender_ticks = u32::MAX; // 二度と戻ってこない
+
+    let (last, log) = drive(&mut nav, &mut reader);
+
+    assert!(
+        matches!(last, Action::Fail(Failure::PageDidNotRender { waited_ms }) if waited_ms >= 3_000),
+        "{last:?}"
+    );
+    assert_eq!(count(&log, |a| matches!(a, Action::MeasurePage | Action::CapturePage { .. })), 0);
 }
 
 #[test]

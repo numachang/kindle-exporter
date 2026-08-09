@@ -9,66 +9,48 @@
 
 | | 状態 |
 |---|---|
-| 設計 | ADR-0001 〜 0006 で確定。未検証項目は下記「残っている不確実性」 |
-| `ke-core` | **完了**（ドメイン型、テスト 31 件） |
-| `ke-nav` | **完了**（純粋状態機械 + フォント校正、テスト 24 件） |
-| `ke-cdp` | 未着手 ← **次はここ** |
+| 設計 | ADR-0001 〜 0007 で確定。未検証項目は下記「残っている不確実性」 |
+| `ke-core` | **完了**（ドメイン型、テスト 36 件） |
+| `ke-nav` | **完了**（純粋状態機械 + フォント校正、テスト 32 件） |
+| `ke-cdp` | **完了**（`trait Browser` + `FakeBrowser` + CDP クライアント、テスト 27 件） |
 | `ke-imaging` / `ke-store` / `ke-workflow` / `ke-cli` | 未着手 |
 | Python 側（`ke_ocr` / `ke_text`） | 未着手 |
 | CI | Rust 3 OS + Python（`py/` が出来たら自動で有効化）すべて green |
 
-現状で `ke-nav` は「本を開く → 表示設定を確定 → 先頭へ巻き戻し → 全ページ撮影」を
-すべて決定できるが、**その決定を実行する相手がいない**。それが `ke-cdp`。
+`ke-nav` の決定を `ke-cdp` が実行できるようになった。
+実機で観測・取得・表示設定・ページ送りがすべて通ることを確認済み
+（`cargo run -p ke-cdp --example probe`）。
+
+**ただし 1 冊を通して撮れることはまだ確認できていない。**
+約 200 ページ送り続けたところでリーダーが応答しなくなった（ADR-0007 実測 10）。
+これが次の最優先課題である。
 
 ---
 
-## 1. `ke-cdp` — ブラウザ抽象と CDP クライアント
+## 0. リーダーの長時間稼働（**最優先。これが解けないと 1 冊も完走できない**）
 
-`ke-nav` が返す [`Action`] を実際のブラウザ操作に変換する層。
+ADR-0007 実測 10。約 200 ページを 300ms 間隔で送り続けると、
+1 ページ 1.0 秒に劣化したのち、**ページ画像も UI ボタンも DOM から消えた状態**になる。
+リロードしても数分は回復しない。
 
-### 設計方針（決定済み）
+測ること:
 
-- **async を使わない。** ブラウザ 1 タブを逐次操作するだけなので `tungstenite` の
-  ブロッキング API で足りる。`ke-nav` も同期なので噛み合う。tokio を持ち込まない
-- `trait Browser` を切り、`FakeBrowser` を同梱する。これで `ke-workflow` 以降も
-  実機ゼロでテストできる
-- HTTP（`/json/version`、`/json/list`）は `ureq` 程度の軽いもので足りる
+1. 何ページ目・何分目から劣化が始まるか（間隔を変えて）
+2. リロードで回復するまでの時間
+3. 送りの間隔を広げれば避けられるか（500ms / 1s）
+4. N ページごとにタブをリロードして続きから再開できるか
+5. blob URL を明示的に `URL.revokeObjectURL` すると変わるか
 
-### 実装する操作
-
-`spikes/cdp_grab.py` と `spikes/font_control.py` がそのまま参照実装になる。
-
-| `Action` | CDP 呼び出し |
-|---|---|
-| `OpenBook` | `Page.navigate` |
-| `OpenSettingsMenu` / `CloseSettingsMenu` | `Runtime.evaluate`（`aria-label="リーダー設定"` を click） |
-| `SetTheme` | 設定メニュー内の UI 操作（**未特定。要調査**） |
-| `ClickFontSlider` | `Input.dispatchMouseEvent`（`ion-range` の矩形 × 割合） |
-| `PressNext` / `PressPrev` | `Input.dispatchKeyEvent` |
-| `CapturePage` | isolated world + canvas → PNG バイト列 |
-| `MeasurePage` | 画像を取って Python 側に測らせる（→ 4 と連動） |
-| 観測 | `Page.getFrameTree` → `Page.createIsolatedWorld` → `Runtime.evaluate` |
-
-### 落とし穴（実測済み。忘れると詰まる）
-
-- **isolated world 必須。** 素の `fetch(blobURL)` は Amazon が `window.fetch` を
-  差し替えているため `TypeError: Failed to fetch` になる
-- CDP のパラメータ名 `grantUniveralAccess` は**プロトコル側の綴り間違い**。直さない
-- メニュー開閉は `ion-menu` の `show-menu` クラスで判定する。`ion-backdrop` は出ない
-- `ion-range` の `value` は JS から読めない。だから「設定 → 実測 → 検証」が要る
-
-### 未特定
-
-**テーマを白にする UI 操作が未特定。** 設定メニュー内にテーマ選択があるはずだが、
-`spikes/open_settings.py` の出力では操作子を特定できていない。
-`ke-cdp` 実装時に設定メニューの DOM を掘る必要がある。
-最悪、テーマが変えられなくても画像を反転すれば動く（ADR-0004 の元の方針に戻すだけ）。
+`ke-cdp` の `examples/probe.rs` に `turn` があるので、ページ数を増やすだけで測れる。
+**結果は必ず ADR に残すこと。** 対策は `ke-workflow` の設計（1 冊を分割して
+再開する単位）に直結する。
 
 ---
 
-## 2. record / replay ハーネス
+## 1. record / replay ハーネス
 
 ADR-0001 §6b。**本設計の主眼**であり、`ke-cdp` の直後に作る。
+`ke-cdp` のテスト（`crates/ke-cdp/tests/browser.rs`）にある `Session` が原型になる。
 
 - `ke capture --record <path>` で全 [`Observation`] と [`Action`] を JSONL に落とす
 - `FakeBrowser` が JSONL を再生する
@@ -78,7 +60,7 @@ ADR-0001 §6b。**本設計の主眼**であり、`ke-cdp` の直後に作る。
 
 ---
 
-## 3. `ke-store` — アーティファクトとイベントログ
+## 2. `ke-store` — アーティファクトとイベントログ
 
 ADR-0001 §3 の配置を実装する。
 
@@ -98,7 +80,7 @@ library/<book-id>/
 
 ---
 
-## 4. Python 側 — `ke_ocr` 常駐ワーカー
+## 3. Python 側 — `ke_ocr` 常駐ワーカー
 
 - `onnxruntime` を直接呼ぶ。**CLI（`src/ocr.py`）は使わない**
   （モデルロード 19 秒 × チャンク数が丸ごと無駄になる）
@@ -115,7 +97,7 @@ library/<book-id>/
 
 ---
 
-## 5. ルビ復元パイプライン
+## 4. ルビ復元パイプライン
 
 ADR-0003 決定 2 + ADR-0005 決定 4。
 
@@ -136,7 +118,7 @@ ADR-0003 決定 2 + ADR-0005 決定 4。
 
 ---
 
-## 6. `proofread` フェーズ — ローカル LLM 校閲
+## 5. `proofread` フェーズ — ローカル LLM 校閲
 
 ADR-0003 決定 4。
 
@@ -149,7 +131,7 @@ ADR-0003 決定 4。
 
 ---
 
-## 7. `ke_text` — 組み立て（`kindle_shot` から流用）
+## 6. `ke_text` — 組み立て（`kindle_shot` から流用）
 
 MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済み。
 派生ファイルの冒頭に由来コメントを入れること。
@@ -166,7 +148,7 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 
 ---
 
-## 8. `ke-imaging` / `ke-workflow` / `ke-cli`
+## 7. `ke-imaging` / `ke-workflow` / `ke-cli`
 
 - **`ke-imaging`**: 白紙・重複・サイズ違いの検証だけ。**余白検出は不要**
   （ADR-0004 決定 2 で `trim` フェーズを削除した）。rayon で並列化
@@ -176,7 +158,7 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 
 ---
 
-## 9. `plan` フェーズ
+## 8. `plan` フェーズ
 
 - 蔵書一覧 → `books.json`。`Xetera/kindle-api`（Node.js から Kindle の内部 API を叩く）が
   使えるか検討する
@@ -192,11 +174,11 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 
 | # | 内容 | 影響 |
 |---|---|---|
-| 1 | **capture の実測所要時間**。既定設定で撮影枚数が約 3.4 倍になるため、capture が全体の律速になる見込み | ADR-0001 の「27.6h → 3〜4h」を測り直す必要がある |
-| 2 | テーマを白にする UI 操作の特定 | 出来なければ画像反転に戻すだけ |
-| 3 | `sideMarginsSize` / `maxNumberColumns` を UI から変えた効果 | 同じフォントサイズでより多くの文字が入る可能性 |
+| 1 | **リーダーの長時間稼働**（上記 0） | **1 冊を完走できるかどうか。最優先** |
+| 2 | **フォント段と画素/文字の対応表**。ADR-0005 は割合で測っており段番号では測っていない | 既定の目標段が決まらない。OCR 環境の再構築が要る |
+| 3 | `sideMarginsSize` / `maxNumberColumns` を UI から変えた効果。操作子は `#narrow` / `#medium` / `#wide` と特定済み | 同じフォントサイズでより多くの文字が入る可能性 |
 | 4 | マンガ（固定レイアウト）でも同じ `kg-full-page-img` 経路か | 経路分岐が要るかどうか |
-| 5 | 洋書・リフロー型英語書籍では DOM にテキストがあるか | あれば書籍種別による分岐に価値が出る |
+| 5 | 洋書・リフロー型英語書籍では DOM にテキストがあるか。chevron の `aria-label` も要確認 | あれば書籍種別による分岐に価値が出る |
 | 6 | アクセシビリティ API（Kindle for PC + UI Automation） | 日本語書籍では見込み薄。洋書があれば確認価値あり |
 
 ---
@@ -208,12 +190,9 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 ### Chrome の専用プロファイル
 
 Amazon にログイン済みの専用プロファイルが要る。
-**調査時のものは Windows の temp 配下（`%TEMP%\ke-chrome-profile`）に作ったため、
-いずれ消える。** 残したいなら退避すること。
-
-作り直す場合は [spikes/README.md](../spikes/README.md) の手順で起動して再ログインする。
-本番でも同じ「専用プロファイル + `--remote-debugging-port`」を使うので、
-temp ではなく永続的な場所（例: `~/.ke-chrome-profile`）に置くのが望ましい。
+**Chrome 136 以降は既定プロファイルだと `--remote-debugging-port` が無視される**ため、
+`--user-data-dir` の指定が必須。置き場所は temp ではなく永続的な場所にする
+（例: `~/.ke-chrome-profile`）。起動手順は [spikes/README.md](../spikes/README.md)。
 
 ### Python 環境
 
@@ -233,6 +212,14 @@ GPU を使う場合の NVIDIA ランタイム（`os.add_dll_directory` が必要
 
 | 項目 | 値 | 出典 |
 |---|---|---|
+| **ページ送り + 取得（`ke-cdp` 経由）** | **約 300ms/頁** | ADR-0007 影響 |
+| **送りの最小間隔** | **100ms。これより短いと黙って無視される** | ADR-0007 実測 8 |
+| 押し直しまでの最適値 | 400ms | ADR-0007 実測 8 |
+| 観測（`Runtime.evaluate`）の下限間隔 | 20ms。詰めるとページが遅くなる | ADR-0007 実測 9 |
+| 表示設定変更後の再描画 | 2.8 秒（その間ページ画像は DOM から消える） | ADR-0007 実測 7 |
+| フォント段 | 0〜13 の 14 段。既定は 5。`value` **属性**から読める | ADR-0007 実測 2 |
+| ページ画像の取り出し（canvas → PNG） | 17ms / 約 600KB | ADR-0007 実測 6 |
+| `createIsolatedWorld` / `Runtime.evaluate` | 1.2ms / 0.3ms | ADR-0007 実測 6 |
 | ページ画像の原寸 | viewport × 1.2（`deviceScaleFactor` は効かない） | ADR-0004 実測 5 |
 | 画素/文字（既定フォント） | 27〜30。viewport を変えても不変 | ADR-0004 実測 5 |
 | 画素/文字（スライダー 65% / 95%） | 45 / 51 | ADR-0005 実測 3 |
@@ -246,3 +233,18 @@ GPU を使う場合の NVIDIA ランタイム（`os.add_dll_directory` が必要
 
 [`Action`]: ../crates/ke-core/src/action.rs
 [`Observation`]: ../crates/ke-core/src/observation.rs
+
+---
+
+## 実機に繋いで確かめる
+
+Chrome を専用プロファイルで起動し、本を開いた状態で:
+
+```bash
+cargo run -p ke-cdp --example probe                # いま観測できることを表示
+cargo run -p ke-cdp --example probe -- capture     # ページ画像を 1 枚取り出す
+cargo run -p ke-cdp --example probe -- settings 9  # 白テーマ + フォント段 9 にする
+cargo run -p ke-cdp --example probe -- turn 20     # 20 ページ送って所要時間を測る
+```
+
+セレクタは実機の DOM に依存しているので、リーダーの UI が変わるとここが最初に壊れる。

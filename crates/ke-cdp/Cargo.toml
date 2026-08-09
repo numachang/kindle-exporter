@@ -1,0 +1,29 @@
+[package]
+name = "ke-cdp"
+description = "Chrome DevTools Protocol でリーダーを駆動する層。trait Browser と、実機不要の FakeBrowser。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# ADR-0001 §4: ブラウザ 1 タブを逐次操作するだけなので async は持ち込まない。
+# 使う CDP メソッドは Target / Page / Input / Runtime の 10 個ほどで、
+# 自前の薄いクライアントの方がモックしやすい。
+[dependencies]
+ke-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# ws:// 127.0.0.1 にしか繋がないので TLS は要らない。
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+ureq = { version = "3", default-features = false }
+base64 = "0.23"
+
+# 撮影層を端から端まで通すテストのためだけに使う（ke-nav は ke-cdp に依存しない）。
+[dev-dependencies]
+ke-nav = { path = "../ke-nav" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

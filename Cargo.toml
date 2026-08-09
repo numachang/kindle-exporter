@@ -2,7 +2,7 @@
 resolver = "3"
 # crate は ADR-0001 §5 の構成に沿って順次追加する:
 #   ke-core / ke-cdp / ke-nav / ke-imaging / ke-store / ke-workflow / ke-cli
-members = ["crates/ke-core", "crates/ke-nav"]
+members = ["crates/ke-core", "crates/ke-cdp", "crates/ke-nav"]
 
 [workspace.dependencies]
 ke-core = { path = "crates/ke-core", version = "0.1.0" }
