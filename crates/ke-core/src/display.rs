@@ -2,8 +2,12 @@
 //!
 //! ADR-0005 の実測に基づく。フォントサイズは OCR 精度の最大レバーであり
 //! （画素/文字 27 → 51、ルビ列の幅 11px → 22px）、リーダーの設定 UI を
-//! 操作しないと変えられない。しかも現在値を読み取れないため、
-//! 「設定 → 実測 → 検証」で目標範囲へ収束させる必要がある。
+//! 操作しないと変えられない。
+//!
+//! フォントサイズは 0 から始まる離散段で表す（ADR-0007 実測 2 で 14 段と実測）。
+//! **現在段は読み取れるので設定は冪等にできる**が、段と画素/文字の対応は
+//! 書籍と viewport に依存するため、目標は画素/文字で指定し、
+//! 「設定 → 実測 → 検証」で収束させる。
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +15,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// 明色にするとページ画像自体が白地黒字で配信されるため、
 /// OCR 前の反転処理が不要になる（ADR-0005 実測 6）。
+/// 実機の設定メニューは 4 択である（ADR-0007 実測 1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Theme {
@@ -19,6 +24,36 @@ pub enum Theme {
     White,
     /// 黒地白字。取得後に反転が必要になるため通常は使わない。
     Dark,
+    /// セピア。
+    Sepia,
+    /// 緑。
+    Green,
+}
+
+/// フォントサイズの操作子について観測できたこと（ADR-0007 実測 2）。
+///
+/// リーダーは `ion-range` の `value` 属性に現在段を、`max` 属性に最大段を持つ。
+/// **JS プロパティとしては読めない**ので、属性から読む必要がある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FontControl {
+    /// 現在の段。
+    pub index: u8,
+    /// 最大の段（実機の実測値は 13。すなわち 0〜13 の 14 段）。
+    pub max: u8,
+}
+
+impl FontControl {
+    /// 現在段と最大段から作る。
+    #[must_use]
+    pub fn new(index: u8, max: u8) -> Self {
+        Self { index, max }
+    }
+
+    /// 指定段を操作可能な範囲に丸める。
+    #[must_use]
+    pub fn clamp(&self, index: u8) -> u8 {
+        index.min(self.max)
+    }
 }
 
 /// フォントサイズ校正の目標。
@@ -115,6 +150,23 @@ mod tests {
         for t in [DisplayTarget::balanced(), DisplayTarget::ruby_first(), DisplayTarget::fast()] {
             let s = serde_json::to_string(&t).unwrap();
             assert_eq!(serde_json::from_str::<DisplayTarget>(&s).unwrap(), t);
+        }
+    }
+
+    /// ADR-0007 実測 2 の実機の段数（0〜13 の 14 段）。
+    #[test]
+    fn clamps_font_steps_to_what_the_reader_offers() {
+        let f = FontControl::new(5, 13);
+        assert_eq!(f.clamp(8), 8);
+        assert_eq!(f.clamp(13), 13);
+        assert_eq!(f.clamp(99), 13, "無い段は最大段に丸める");
+    }
+
+    #[test]
+    fn themes_round_trip_through_json() {
+        for t in [Theme::White, Theme::Dark, Theme::Sepia, Theme::Green] {
+            let s = serde_json::to_string(&t).unwrap();
+            assert_eq!(serde_json::from_str::<Theme>(&s).unwrap(), t);
         }
     }
 }

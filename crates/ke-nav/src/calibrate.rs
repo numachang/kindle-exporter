@@ -1,59 +1,63 @@
 //! フォントサイズ校正。
 //!
-//! リーダーのフォントサイズはスライダーでしか変えられず、**現在値を読み取れない**
-//! （ADR-0005 実測 2）。そのため設定は冪等にできず、
-//! 「スライダーを動かす → 1 ページ実測する → 目標範囲か確認する」を
-//! 繰り返して収束させる。
+//! リーダーのフォントサイズは 0 から始まる離散段で、現在段は
+//! `ion-range` の `value` **属性**から読める（ADR-0007 実測 2。実機は 0〜13 の 14 段）。
+//! したがって設定そのものは冪等にできる。
 //!
-//! スライダー位置に対する画素/文字は単調非減少である（ADR-0005 実測 3 の
-//! 5% → 27、35% → 27、65% → 45、95% → 51）。したがって二分探索が使える。
-//! 5% と 35% が同値であることから分かるとおりスライダーは離散段階を持つので、
-//! 探索区間が潰れても収束しない場合があり、試行回数の上限が必要になる。
+//! それでも校正が要るのは、**段と画素/文字の対応が書籍と viewport に依存する**
+//! ためである。目標は段番号ではなく画素/文字で持ち、
+//! 「段を設定する → 1 ページ実測する → 目標範囲か確認する」で収束させる。
+//!
+//! 段に対する画素/文字は単調非減少である（ADR-0005 実測 3 の
+//! 5% → 27、35% → 27、65% → 45、95% → 51）。したがって二分探索が使え、
+//! 14 段なら 4 回以内に必ず打ち切れる。
+//! 5% と 35% が同値であることから分かるとおり平坦な区間があるので、
+//! 探索区間が尽きても目標に入らないことがある。その場合は諦めて先へ進む。
 
 use ke_core::DisplayTarget;
 
 /// 校正 1 回分の判断。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     /// 目標範囲に入った。値は採用した画素/文字。
     Satisfied(u32),
-    /// まだ範囲外。次に試すスライダー位置。
-    Retry(f32),
-    /// 試行回数を使い切った。値は最後に実測した画素/文字。
+    /// まだ範囲外。次に試すフォント段。
+    Retry(u8),
+    /// 探索区間か試行回数を使い切った。値は最後に実測した画素/文字。
     GiveUp(u32),
 }
 
 impl Step {
-    /// 次に試すスライダー位置（`Retry` のときのみ）。
+    /// 次に試すフォント段（`Retry` のときのみ）。
     #[must_use]
-    pub fn retry_fraction(self) -> Option<f32> {
+    pub fn retry_index(self) -> Option<u8> {
         match self {
-            Self::Retry(f) => Some(f),
+            Self::Retry(i) => Some(i),
             _ => None,
         }
     }
 }
 
-/// スライダー位置の二分探索。
+/// フォント段の二分探索。
 #[derive(Debug, Clone)]
 pub struct Calibrator {
     target: DisplayTarget,
-    lo: f32,
-    hi: f32,
-    current: f32,
+    lo: u8,
+    hi: u8,
+    current: u8,
     attempts: u8,
 }
 
 impl Calibrator {
-    /// 目標を与えて校正を始める。最初は中央から試す。
+    /// 目標と、リーダーが持つ最大段を与えて校正を始める。最初は中央から試す。
     #[must_use]
-    pub fn new(target: DisplayTarget) -> Self {
-        Self { target, lo: 0.0, hi: 1.0, current: 0.5, attempts: 0 }
+    pub fn new(target: DisplayTarget, max_index: u8) -> Self {
+        Self { target, lo: 0, hi: max_index, current: max_index / 2, attempts: 0 }
     }
 
-    /// いま試すべきスライダー位置。
+    /// いま試すべきフォント段。
     #[must_use]
-    pub fn fraction(&self) -> f32 {
+    pub fn index(&self) -> u8 {
         self.current
     }
 
@@ -72,13 +76,28 @@ impl Calibrator {
         if self.attempts >= self.target.max_calibration_attempts {
             return Step::GiveUp(px_per_char);
         }
-        if self.target.needs_larger(px_per_char) {
-            self.lo = self.current;
+        if self.narrow(self.target.needs_larger(px_per_char)) {
+            Step::Retry(self.current)
         } else {
-            self.hi = self.current;
+            Step::GiveUp(px_per_char)
         }
-        self.current = f32::midpoint(self.lo, self.hi);
-        Step::Retry(self.current)
+    }
+
+    /// 探索区間を半分にする。試せる段が残っていなければ `false`。
+    fn narrow(&mut self, need_larger: bool) -> bool {
+        if need_larger {
+            if self.current >= self.hi {
+                return false;
+            }
+            self.lo = self.current.saturating_add(1);
+        } else {
+            if self.current <= self.lo {
+                return false;
+            }
+            self.hi = self.current.saturating_sub(1);
+        }
+        self.current = self.lo + (self.hi - self.lo) / 2;
+        true
     }
 }
 
@@ -86,22 +105,26 @@ impl Calibrator {
 mod tests {
     use super::*;
 
-    /// ADR-0005 実測 3 のスライダー位置と画素/文字の対応を再現する。
-    /// 段階的で、5% と 35% は同値になる。
-    fn measured(fraction: f32) -> u32 {
-        match fraction {
-            f if f < 0.5 => 27,
-            f if f < 0.8 => 45,
+    /// 実機の段数（ADR-0007 実測 2）。
+    const MAX_INDEX: u8 = 13;
+
+    /// ADR-0005 実測 3 の割合を段番号に読み替えた応答。
+    /// 既定段 5 で画素/文字 27（ADR-0007 実測 2 と一致）、
+    /// 65% ≒ 段 8 で 45、95% ≒ 段 12 で 51。平坦な区間を持つ。
+    fn measured(index: u8) -> u32 {
+        match index {
+            0..=6 => 27,
+            7..=10 => 45,
             _ => 51,
         }
     }
 
     fn run(target: DisplayTarget) -> (Step, u8) {
-        let mut c = Calibrator::new(target);
+        let mut c = Calibrator::new(target, MAX_INDEX);
         loop {
-            let step = c.observe(measured(c.fraction()));
+            let step = c.observe(measured(c.index()));
             match step {
-                Step::Retry(f) => assert!((0.0..=1.0).contains(&f)),
+                Step::Retry(i) => assert!(i <= MAX_INDEX, "段 {i} は存在しない"),
                 other => return (other, c.attempts()),
             }
         }
@@ -111,7 +134,7 @@ mod tests {
     fn converges_on_the_balanced_target() {
         let (step, attempts) = run(DisplayTarget::balanced());
         assert_eq!(step, Step::Satisfied(45));
-        assert!(attempts <= 3, "{attempts} 回もかかるべきではない");
+        assert!(attempts <= 4, "14 段なら 4 回以内に収束する（{attempts} 回）");
     }
 
     #[test]
@@ -125,22 +148,22 @@ mod tests {
     }
 
     #[test]
-    fn moves_the_slider_up_when_characters_are_too_small() {
-        let mut c = Calibrator::new(DisplayTarget::balanced());
-        let before = c.fraction();
-        let next = c.observe(27).retry_fraction().expect("まだ範囲外なので再試行になる");
-        assert!(next > before, "小さすぎるならスライダーは右へ動くべき");
+    fn moves_up_when_characters_are_too_small() {
+        let mut c = Calibrator::new(DisplayTarget::balanced(), MAX_INDEX);
+        let before = c.index();
+        let next = c.observe(27).retry_index().expect("まだ範囲外なので再試行になる");
+        assert!(next > before, "小さすぎるなら段を上げる");
     }
 
     #[test]
-    fn moves_the_slider_down_when_characters_are_too_large() {
-        let mut c = Calibrator::new(DisplayTarget::balanced());
-        let before = c.fraction();
-        let next = c.observe(80).retry_fraction().expect("まだ範囲外なので再試行になる");
-        assert!(next < before, "大きすぎるならスライダーは左へ動くべき");
+    fn moves_down_when_characters_are_too_large() {
+        let mut c = Calibrator::new(DisplayTarget::balanced(), MAX_INDEX);
+        let before = c.index();
+        let next = c.observe(80).retry_index().expect("まだ範囲外なので再試行になる");
+        assert!(next < before, "大きすぎるなら段を下げる");
     }
 
-    /// 目標が達成できない設定でも、試行回数の上限で必ず止まる。
+    /// 目標が達成できない設定でも、探索区間が尽きた時点で必ず止まる。
     #[test]
     fn gives_up_instead_of_looping_forever() {
         let impossible = DisplayTarget {
@@ -149,13 +172,21 @@ mod tests {
             ..DisplayTarget::balanced()
         };
         let (step, attempts) = run(impossible);
-        assert!(matches!(step, Step::GiveUp(_)));
-        assert_eq!(attempts, impossible.max_calibration_attempts);
+        assert!(matches!(step, Step::GiveUp(_)), "{step:?}");
+        assert!(attempts <= impossible.max_calibration_attempts);
+    }
+
+    /// 段が 1 つしかないリーダーでも、無限に試し続けない。
+    #[test]
+    fn gives_up_when_there_is_only_one_step() {
+        let mut c = Calibrator::new(DisplayTarget::balanced(), 0);
+        assert_eq!(c.index(), 0);
+        assert_eq!(c.observe(27), Step::GiveUp(27));
     }
 
     #[test]
     fn stops_immediately_when_the_first_measurement_already_fits() {
-        let mut c = Calibrator::new(DisplayTarget::balanced());
+        let mut c = Calibrator::new(DisplayTarget::balanced(), MAX_INDEX);
         assert_eq!(c.observe(45), Step::Satisfied(45));
         assert_eq!(c.attempts(), 1);
     }

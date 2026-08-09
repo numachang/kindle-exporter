@@ -43,10 +43,12 @@ pub enum Action {
     CloseSettingsMenu,
     /// 配色テーマを設定する。
     SetTheme(Theme),
-    /// フォントサイズのスライダーを、左端からの割合で指定した位置にクリックする。
-    ClickFontSlider {
-        /// 0.0（最小）〜1.0（最大）。
-        fraction: f32,
+    /// フォントサイズを指定の段にする。
+    ///
+    /// 現在段は観測できるので（ADR-0007 実測 2）、この行動は**冪等である**。
+    SetFontSize {
+        /// 0（最小）から [`crate::FontControl::max`] までの段。
+        index: u8,
     },
     /// 現在のページを実測する（画素/文字を得るため）。
     MeasurePage,
@@ -136,9 +138,11 @@ mod tests {
         let actions = vec![
             Action::OpenBook { url: "https://read.amazon.co.jp/?asin=B0TESTBOOK".into() },
             Action::Wait { ms: 1200, reason: WaitReason::BookLoading },
-            Action::ClickFontSlider { fraction: 0.65 },
+            Action::SetTheme(crate::Theme::White),
+            Action::SetFontSize { index: 8 },
             Action::MeasurePage,
             Action::CapturePage { label: PageLabel::new(1, Some(431)) },
+            Action::CapturePage { label: PageLabel::at_location(9783, Some(10167)) },
             Action::Fail(Failure::PageDidNotAdvance { at: PageLabel::new(7, None) }),
         ];
         let json = serde_json::to_string(&actions).unwrap();

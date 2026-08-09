@@ -10,32 +10,35 @@
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 use ke_core::{
-    Action, Asin, BookSpec, DisplayTarget, Failure, Observation, PageImageInfo, PageLabel,
-    PageMetrics, Rect, Theme,
+    Action, Asin, BookSpec, DisplayTarget, Failure, FontControl, Observation, PageImageInfo,
+    PageLabel, PageMetrics, Theme,
 };
 use ke_nav::{Limits, Navigator};
 
 /// テストで無限ループにならないための保険。
 const MAX_STEPS: usize = 4_000;
 
-/// スライダー位置から画素/文字を返す関数（ADR-0005 実測 3 を模した段階的な応答）。
-type FontResponse = fn(f32) -> u32;
+/// 実機のフォント段数（ADR-0007 実測 2 で 0〜13 の 14 段）。
+const MAX_FONT_INDEX: u8 = 13;
 
-fn measured_from_slider(fraction: f32) -> u32 {
-    match fraction {
-        f if f < 0.5 => 27,
-        f if f < 0.8 => 45,
+/// フォント段から画素/文字を返す関数（ADR-0005 実測 3 を段番号に読み替えた応答）。
+type FontResponse = fn(u8) -> u32;
+
+fn measured_from_index(index: u8) -> u32 {
+    match index {
+        0..=6 => 27,
+        7..=10 => 45,
         _ => 51,
     }
 }
 
-/// 右へ大きく動かさないと目標に届かないリーダー（再校正が要る場合の検証用）。
-fn stiff_slider(fraction: f32) -> u32 {
-    if fraction < 0.7 { 27 } else { 45 }
+/// かなり上げないと目標に届かないリーダー（再校正が要る場合の検証用）。
+fn stiff_font(index: u8) -> u32 {
+    if index < 12 { 27 } else { 45 }
 }
 
 /// 常に目標に届かないリーダー（校正が収束しない場合の検証用）。
-fn always_tiny(_fraction: f32) -> u32 {
+fn always_tiny(_index: u8) -> u32 {
     12
 }
 
@@ -50,7 +53,8 @@ struct FakeReader {
     /// メニューが開けるか（開けない障害の再現用）。
     menu_operable: bool,
     theme: Option<Theme>,
-    slider: f32,
+    font_index: u8,
+    font_max: u8,
     font_response: FontResponse,
     /// 次の観測に実測値を載せるか。
     emit_metrics: bool,
@@ -58,8 +62,12 @@ struct FakeReader {
     can_advance: bool,
     /// 巻き戻しで到達できる最小ページ（1 に戻れない書籍の再現用）。
     min_page: u32,
+    /// 送りで到達できる最大位置。`None` なら総数まで。
+    stop_at: Option<u32>,
     /// 位置表示を持つか。
     has_label: bool,
+    /// 位置表示が「ページ」ではなく Kindle の「位置」か（ADR-0007 実測 5）。
+    locations: bool,
     captured: Vec<PageLabel>,
 }
 
@@ -73,13 +81,24 @@ impl FakeReader {
             menu_open: false,
             menu_operable: true,
             theme: Some(Theme::Dark),
-            slider: 0.5,
-            font_response: measured_from_slider,
+            font_index: 5, // 実機の既定値（ADR-0007 実測 2）
+            font_max: MAX_FONT_INDEX,
+            font_response: measured_from_index,
             emit_metrics: false,
             can_advance: true,
             min_page: 1,
+            stop_at: None,
             has_label: true,
+            locations: false,
             captured: Vec::new(),
+        }
+    }
+
+    fn label(&self) -> PageLabel {
+        if self.locations {
+            PageLabel::at_location(self.page, self.total)
+        } else {
+            PageLabel::new(self.page, self.total)
         }
     }
 
@@ -88,12 +107,12 @@ impl FakeReader {
         let loaded = self.ticks > self.load_ticks;
         Observation {
             elapsed_ms: 1_000,
-            page: (loaded && self.has_label).then(|| PageLabel::new(self.page, self.total)),
+            page: (loaded && self.has_label).then(|| self.label()),
             image: loaded.then(|| {
                 PageImageInfo::ready(1501, 1692).with_source(format!("blob:page-{}", self.page))
             }),
             settings_menu_open: self.menu_open,
-            font_slider: self.menu_open.then(|| Rect::new(1455.0, 217.0, 312.0, 42.0)),
+            font: self.menu_open.then(|| FontControl::new(self.font_index, self.font_max)),
             theme: self.theme,
             metrics: self.take_metrics(),
         }
@@ -103,7 +122,7 @@ impl FakeReader {
         if !std::mem::take(&mut self.emit_metrics) {
             return None;
         }
-        Some(PageMetrics { px_per_char: (self.font_response)(self.slider), chars: 536 })
+        Some(PageMetrics { px_per_char: (self.font_response)(self.font_index), chars: 536 })
     }
 
     fn apply(&mut self, action: &Action) {
@@ -111,7 +130,7 @@ impl FakeReader {
             Action::OpenSettingsMenu if self.menu_operable => self.menu_open = true,
             Action::CloseSettingsMenu if self.menu_operable => self.menu_open = false,
             Action::SetTheme(t) => self.theme = Some(*t),
-            Action::ClickFontSlider { fraction } => self.slider = *fraction,
+            Action::SetFontSize { index } => self.font_index = (*index).min(self.font_max),
             Action::MeasurePage => self.emit_metrics = true,
             Action::CapturePage { label } => self.captured.push(label.clone()),
             Action::PressNext => self.turn(1),
@@ -125,7 +144,7 @@ impl FakeReader {
             return;
         }
         let next = i64::from(self.page) + delta;
-        let hi = self.total.map_or(i64::MAX, i64::from);
+        let hi = self.stop_at.or(self.total).map_or(i64::MAX, i64::from);
         self.page = next.clamp(i64::from(self.min_page), hi).try_into().unwrap_or(self.page);
     }
 }
@@ -204,7 +223,7 @@ fn sets_the_theme_before_touching_the_font_slider() {
     let (_, log) = drive(&mut nav, &mut reader);
 
     let theme_at = log.iter().position(|a| matches!(a, Action::SetTheme(_)));
-    let font_at = log.iter().position(|a| matches!(a, Action::ClickFontSlider { .. }));
+    let font_at = log.iter().position(|a| matches!(a, Action::SetFontSize { .. }));
     assert!(theme_at.is_some(), "暗色のままなら明色に変える");
     assert!(theme_at < font_at, "テーマを決めてからフォントを触る");
     assert_eq!(reader.theme, Some(Theme::White), "白地黒字にして反転処理を不要にする");
@@ -223,21 +242,38 @@ fn skips_the_theme_step_when_it_is_already_correct() {
 fn recalibrates_the_font_until_the_target_is_met() {
     let mut nav = Navigator::with_limits(spec(), quick_limits());
     let mut reader = FakeReader::new(1, 2);
-    // 初手（0.5）では届かないので、右へ動かし直す必要がある
-    reader.font_response = stiff_slider;
+    // 初手（中央の段）では届かないので、上げ直す必要がある
+    reader.font_response = stiff_font;
 
     let (_, log) = drive(&mut nav, &mut reader);
 
-    let clicks: Vec<f32> = log
+    let steps: Vec<u8> = log
         .iter()
         .filter_map(|a| match a {
-            Action::ClickFontSlider { fraction } => Some(*fraction),
+            Action::SetFontSize { index } => Some(*index),
             _ => None,
         })
         .collect();
-    assert!(clicks.len() >= 2, "1 回で決まらないなら再校正する: {clicks:?}");
-    assert!(clicks.windows(2).all(|w| w[1] > w[0]), "小さすぎるので右へ動かし続ける: {clicks:?}");
+    assert!(steps.len() >= 2, "1 回で決まらないなら再校正する: {steps:?}");
+    assert!(steps.windows(2).all(|w| w[1] > w[0]), "小さすぎるので段を上げ続ける: {steps:?}");
     assert_eq!(nav.px_per_char(), Some(45), "目標範囲に収束する");
+}
+
+/// 段はリーダーが持つ最大段を超えない。
+#[test]
+fn never_asks_for_a_font_step_the_reader_does_not_have() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 2);
+    reader.font_max = 4;
+    reader.font_response = always_tiny; // 目標に届かないので段を上げ切る
+
+    let (_, log) = drive(&mut nav, &mut reader);
+
+    for a in &log {
+        if let Action::SetFontSize { index } = a {
+            assert!(*index <= 4, "存在しない段 {index} を指定した");
+        }
+    }
 }
 
 #[test]
@@ -343,6 +379,37 @@ fn fails_when_a_page_stops_advancing_before_the_end() {
     );
 }
 
+/// 「位置」表示の書籍は、巻末に達しても位置が総数に届かない（ADR-0007 実測 5）。
+/// これを故障と誤判定すると、全ページ撮り終えた書籍を捨ててしまう。
+#[test]
+fn finishes_a_location_style_book_without_confirming_the_end() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 10_167);
+    reader.locations = true;
+    reader.stop_at = Some(40); // 位置 40 が実際の巻末。総数 10167 には遠く届かない
+
+    let (last, _) = drive(&mut nav, &mut reader);
+
+    let Action::Done(summary) = last else { panic!("失敗にしてはいけない: {last:?}") };
+    assert!(!summary.end_confirmed, "巻末を確定したと言ってはいけない");
+    assert_eq!(summary.captured_pages, 40);
+}
+
+/// 同じ「途中で止まる」でも、ページ番号を持つ書籍なら故障と判定できる。
+#[test]
+fn a_page_numbered_book_that_stops_early_is_a_failure() {
+    let mut nav = Navigator::with_limits(spec(), quick_limits());
+    let mut reader = FakeReader::new(1, 100);
+    reader.stop_at = Some(40);
+
+    let (last, _) = drive(&mut nav, &mut reader);
+
+    assert!(
+        matches!(&last, Action::Fail(Failure::PageDidNotAdvance { at }) if at.current == 40),
+        "{last:?}"
+    );
+}
+
 #[test]
 fn stops_at_the_page_cap_instead_of_running_away() {
     let limits = Limits { max_pages: 5, ..quick_limits() };
@@ -365,8 +432,8 @@ fn proceeds_with_the_best_effort_when_calibration_cannot_converge() {
 
     assert!(matches!(last, Action::Done(_)), "校正に失敗しても撮影はする: {last:?}");
     assert_eq!(nav.px_per_char(), Some(12), "実測できた最後の値を記録する");
-    let clicks = count(&log, |a| matches!(a, Action::ClickFontSlider { .. }));
-    assert!(clicks <= usize::from(DisplayTarget::default().max_calibration_attempts));
+    let steps = count(&log, |a| matches!(a, Action::SetFontSize { .. }));
+    assert!(steps <= usize::from(DisplayTarget::default().max_calibration_attempts));
 }
 
 #[test]

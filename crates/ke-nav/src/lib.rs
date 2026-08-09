@@ -23,7 +23,9 @@ mod calibrate;
 
 pub use calibrate::{Calibrator, Step as CalibrationStep};
 
-use ke_core::{Action, BookSpec, Failure, Observation, PageLabel, Summary, WaitReason};
+use ke_core::{
+    Action, BookSpec, Failure, FontControl, Observation, PageLabel, Summary, WaitReason,
+};
 
 /// 各種の打ち切り条件。実機の挙動に合わせて調整する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +87,8 @@ pub struct Navigator {
     spec: BookSpec,
     limits: Limits,
     state: State,
-    calibrator: Calibrator,
+    /// フォント段の数はリーダーを見るまで分からないので、最初の観測で作る。
+    calibrator: Option<Calibrator>,
     captured: u32,
     px_per_char: Option<u32>,
     /// 終端に達したときの行動。以降はこれを返し続ける。
@@ -102,12 +105,11 @@ impl Navigator {
     /// 打ち切り条件を指定して作る。
     #[must_use]
     pub fn with_limits(spec: BookSpec, limits: Limits) -> Self {
-        let calibrator = Calibrator::new(spec.display);
         Self {
             spec,
             limits,
             state: State::Start,
-            calibrator,
+            calibrator: None,
             captured: 0,
             px_per_char: None,
             outcome: None,
@@ -212,18 +214,27 @@ impl Navigator {
         (wait(WAIT_LOAD_MS, WaitReason::BookLoading), State::LoadingBook { waited_ms: waited })
     }
 
-    fn on_menu_opening(&self, obs: &Observation, attempts: u8) -> (Action, State) {
-        if obs.settings_menu_open && obs.font_slider.is_some() {
-            if obs.theme != Some(self.spec.display.theme) {
-                return (Action::SetTheme(self.spec.display.theme), State::ThemeWait);
-            }
-            let fraction = self.calibrator.fraction();
-            return (Action::ClickFontSlider { fraction }, State::FontWait);
+    fn on_menu_opening(&mut self, obs: &Observation, attempts: u8) -> (Action, State) {
+        // メニューが開いていても、開閉アニメーションの途中では操作子が見えない。
+        if let Some(font) = obs.font.filter(|_| obs.settings_menu_open) {
+            return self.on_settings_ready(obs, font);
         }
         if attempts >= self.limits.menu_attempts {
             return (fail(Failure::SettingsMenuUnavailable), State::Ended);
         }
         (Action::OpenSettingsMenu, State::MenuOpenWait { attempts: attempts.saturating_add(1) })
+    }
+
+    /// 設定を触れる状態になった。テーマを先に決め、次にフォント段を決める。
+    fn on_settings_ready(&mut self, obs: &Observation, font: FontControl) -> (Action, State) {
+        if obs.theme != Some(self.spec.display.theme) {
+            return (Action::SetTheme(self.spec.display.theme), State::ThemeWait);
+        }
+        // 段数はリーダーを見るまで分からないので、ここで初めて校正器を作る。
+        let target = self.spec.display;
+        let index =
+            self.calibrator.get_or_insert_with(|| Calibrator::new(target, font.max)).index();
+        (Action::SetFontSize { index: font.clamp(index) }, State::FontWait)
     }
 
     fn on_menu_closing(&self, obs: &Observation, attempts: u8) -> (Action, State) {
@@ -241,7 +252,13 @@ impl Navigator {
             // 実測がまだ返っていない。もう一度観測する。
             return (wait(WAIT_APPLY_MS, WaitReason::SettingsApplied), State::Measuring);
         };
-        match self.calibrator.observe(m.px_per_char) {
+        // 校正器が無いのは設定 UI に一度も触れられなかった場合。
+        // 校正はできないが、実測できた値は記録して撮影に進む。
+        let step = self
+            .calibrator
+            .as_mut()
+            .map_or(CalibrationStep::GiveUp(m.px_per_char), |c| c.observe(m.px_per_char));
+        match step {
             CalibrationStep::Satisfied(px) | CalibrationStep::GiveUp(px) => {
                 self.px_per_char = Some(px);
                 self.start_rewind(obs)
@@ -329,12 +346,13 @@ impl Navigator {
     /// ページが進まなくなったときの扱い。
     ///
     /// 総ページ数が分かる書籍なら、巻末に達していないのに止まったのは故障である。
-    /// 総ページ数が分からない書籍では巻末と故障を区別できないので、
+    /// **「位置」表示の書籍では巻末と故障を区別できない**ので（ADR-0007 実測 5）、
     /// 打ち切って `end_confirmed: false` を立て、後段に判断を委ねる。
+    /// ここを取り違えると、全ページ撮り終えた書籍を失敗として捨ててしまう。
     fn on_stall(&self, from: &Observation) -> (Action, State) {
         match from.page.as_ref() {
             Some(p) if p.is_last() => (self.finish(true), State::Ended),
-            Some(p) if p.total.is_some() => {
+            Some(p) if p.can_confirm_end() => {
                 (fail(Failure::PageDidNotAdvance { at: p.clone() }), State::Ended)
             }
             _ => (self.finish(false), State::Ended),

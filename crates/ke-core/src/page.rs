@@ -4,27 +4,51 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// 位置表示が何を数えているか（ADR-0007 実測 5）。
+///
+/// リーダーは書籍によって `33/431ページ` とも `位置9783/10167 ● 96%` とも表示する。
+/// **この違いは巻末を確定できるかどうかを分ける**ため、型で区別する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelKind {
+    /// ページ番号。総数はページ数なので、最終ページで総数と一致する。
+    #[default]
+    Page,
+    /// Kindle の「位置」。1 ページで 41〜55 進むため、
+    /// **最終ページの位置が総数と一致するとは限らない。**
+    Location,
+}
+
 /// リーダーが表示している位置。
 ///
-/// Cloud Reader のフッターには `33/431ページ` のような表示があり、
+/// Cloud Reader のフッター（`.text-div`）にあり、
 /// これがページ遷移の**確定シグナル**になる（ADR-0004 決定 3）。
 /// 書籍によっては総数が無い形式もあるため、`total` は省略可能とする。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PageLabel {
     /// 現在位置。
     pub current: u32,
-    /// 総ページ数。取得できない書籍では `None`。
+    /// 総数。取得できない書籍では `None`。
     pub total: Option<u32>,
+    /// 何を数えている値か。既存のフィクスチャを読めるよう既定は [`LabelKind::Page`]。
+    #[serde(default)]
+    pub kind: LabelKind,
 }
 
 impl PageLabel {
-    /// 位置と総数から作る。
+    /// ページ番号として作る。
     #[must_use]
     pub fn new(current: u32, total: Option<u32>) -> Self {
-        Self { current, total }
+        Self { current, total, kind: LabelKind::Page }
     }
 
-    /// `33/431ページ` のような表示文字列から読み取る。
+    /// Kindle の「位置」として作る。
+    #[must_use]
+    pub fn at_location(current: u32, total: Option<u32>) -> Self {
+        Self { current, total, kind: LabelKind::Location }
+    }
+
+    /// `33/431ページ` や `位置9783/10167 ● 96%` のような表示文字列から読み取る。
     ///
     /// 桁区切りのカンマ、全角スペース、前後の余分な文字を許容する。
     /// 読み取れなければ `None`。
@@ -40,7 +64,8 @@ impl PageLabel {
         let (a, b) = token.split_once('/')?;
         let current = a.parse().ok()?;
         let total = b.parse().ok();
-        Some(Self { current, total })
+        let kind = if text.contains("位置") { LabelKind::Location } else { LabelKind::Page };
+        Some(Self { current, total, kind })
     }
 
     /// 先頭ページに到達しているか。
@@ -54,13 +79,29 @@ impl PageLabel {
     pub fn is_last(&self) -> bool {
         self.total.is_some_and(|t| self.current >= t)
     }
+
+    /// 総数がページ数であり、**巻末を確定できる**か。
+    ///
+    /// 「位置」形式の書籍では、送りが止まったのが巻末なのか故障なのかを
+    /// 区別できない。その場合は打ち切って `Summary.end_confirmed` を `false` にする
+    /// （ADR-0007 決定 5）。
+    #[must_use]
+    pub fn can_confirm_end(&self) -> bool {
+        self.kind == LabelKind::Page && self.total.is_some()
+    }
 }
 
 impl fmt::Display for PageLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.total {
-            Some(t) => write!(f, "{}/{}ページ", self.current, t),
-            None => write!(f, "{}ページ", self.current),
+        let unit = match self.kind {
+            LabelKind::Page => "ページ",
+            LabelKind::Location => "位置",
+        };
+        match (self.kind, self.total) {
+            (LabelKind::Page, Some(t)) => write!(f, "{}/{}{unit}", self.current, t),
+            (LabelKind::Page, None) => write!(f, "{}{unit}", self.current),
+            (LabelKind::Location, Some(t)) => write!(f, "{unit}{}/{}", self.current, t),
+            (LabelKind::Location, None) => write!(f, "{unit}{}", self.current),
         }
     }
 }
@@ -140,6 +181,23 @@ mod tests {
         assert_eq!(l.to_string(), "33/431ページ");
     }
 
+    /// ADR-0007 実測 5: ページ番号を持たない書籍は「位置」で表示する。
+    #[test]
+    fn parses_the_location_style_footer() {
+        let l = PageLabel::parse("位置9783/10167\u{2002}●\u{2002}96%").unwrap();
+        assert_eq!(l, PageLabel::at_location(9783, Some(10167)));
+        assert_eq!(l.to_string(), "位置9783/10167");
+    }
+
+    /// 「位置」形式では巻末を確定できない。ここを取り違えると、
+    /// 全ページ撮り終えた書籍を「送りが壊れた」と誤判定する。
+    #[test]
+    fn only_page_numbers_can_confirm_the_end_of_a_book() {
+        assert!(PageLabel::new(33, Some(431)).can_confirm_end());
+        assert!(!PageLabel::at_location(9783, Some(10167)).can_confirm_end());
+        assert!(!PageLabel::new(33, None).can_confirm_end());
+    }
+
     #[test]
     fn parses_labels_with_thousands_separators() {
         let l = PageLabel::parse("1,234/5,678ページ").unwrap();
@@ -160,6 +218,13 @@ mod tests {
         assert!(!PageLabel::new(430, Some(431)).is_last());
         // 総数が不明なら末尾判定はできない
         assert!(!PageLabel::new(430, None).is_last());
+    }
+
+    /// 種別を持たない古いフィクスチャは「ページ」として読める。
+    #[test]
+    fn older_fixtures_without_a_kind_still_load() {
+        let l: PageLabel = serde_json::from_str(r#"{"current":33,"total":431}"#).unwrap();
+        assert_eq!(l, PageLabel::new(33, Some(431)));
     }
 
     #[test]

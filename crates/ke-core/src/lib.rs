@@ -10,7 +10,7 @@
 //!
 //! - [`Asin`] / [`BookSpec`] — 何を処理するか
 //! - [`Phase`] / [`Capability`] — どの工程を、どのホストで実行するか
-//! - [`DisplayTarget`] / [`Theme`] — キャプチャ時のリーダー表示設定
+//! - [`DisplayTarget`] / [`Theme`] / [`FontControl`] — キャプチャ時のリーダー表示設定
 //! - [`PageLabel`] / [`PageImageInfo`] / [`PageMetrics`] — ページの位置・画像・品質
 //! - [`Observation`] / [`Action`] — 状態機械の入力と出力
 
@@ -25,7 +25,7 @@ mod phase;
 
 pub use action::{Action, Failure, Summary, WaitReason};
 pub use book::{Asin, AsinError, BookSpec};
-pub use display::{DisplayTarget, Theme};
-pub use observation::{Observation, Rect};
-pub use page::{PageImageInfo, PageLabel, PageMetrics};
+pub use display::{DisplayTarget, FontControl, Theme};
+pub use observation::Observation;
+pub use page::{LabelKind, PageImageInfo, PageLabel, PageMetrics};
 pub use phase::{ALL_PHASES, Capability, Phase};

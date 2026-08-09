@@ -21,6 +21,9 @@ venv/
 *.azw*
 # record/replay のフィクスチャは fixtures/ 配下のみ明示的に追加する
 /recordings/
+# spikes が実機から取得したページ画像・OCR 結果。実在書籍の中身なので絶対に追加しない
+/spikes/cdp_out/
+/spikes/ndlocr-lite/
 
 # --- ローカル設定・秘密情報 ---
 .env
