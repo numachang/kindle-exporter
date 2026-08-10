@@ -1,0 +1,22 @@
+[package]
+name = "ke-store"
+description = "アーティファクトの配置、追記専用のイベントログ、フェーズの排他ロック。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# ADR-0001 §3: 単一 SQLite を置かない。ネットワーク共有上ではロックが壊れる。
+# 書籍ごとの追記専用 JSONL とファイル配置だけで済ませるので、依存は増やさない。
+[dependencies]
+ke-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

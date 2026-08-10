@@ -13,7 +13,9 @@
 | `ke-core` | **完了**（ドメイン型、テスト 36 件） |
 | `ke-nav` | **完了**（純粋状態機械 + フォント校正、テスト 32 件） |
 | `ke-cdp` | **完了**（`trait Browser` + `FakeBrowser` + CDP クライアント + 記録/再生、テスト 40 件） |
-| `ke-imaging` / `ke-store` / `ke-workflow` / `ke-cli` | 未着手 |
+| `ke-store` | **完了**（配置・追記専用イベントログ・lease、テスト 17 件） |
+| `ke-workflow` | capture フェーズ **完了**（テスト 12 件）。他のフェーズは未着手 |
+| `ke-imaging` / `ke-cli` | 未着手 |
 | Python 側（`ke_ocr` / `ke_text`） | 未着手 |
 | CI | Rust 3 OS + Python（`py/` が出来たら自動で有効化）すべて green |
 
@@ -21,9 +23,14 @@
 実機で観測・取得・表示設定・ページ送りがすべて通ることを確認済み
 （`cargo run -p ke-cdp --example probe`）。
 
-巻末・先頭の検出、ページ送り、表示設定、ページ画像の取得はすべて実機で通っている。
-**ただし先頭から巻末まで一気に撮り切る経路はまだ通していない**（1 の record/replay と
-`ke-workflow` が要る）。
+**実機から保管庫まで一本で通るようになった。**
+`cargo run -p ke-workflow --example shoot -- <ASIN> <保管庫> [枚数]` で、
+本を開き、表示設定を確定し、先頭へ巻き戻し、ページ画像を
+`library/<ASIN>/pages/raw/0001.png` に保存し、経過を `events.jsonl` に残す。
+途中で落ちても、もう一度走らせれば撮り切る。
+
+**残っているのは画素/文字の実測（OCR）だけである。** それが無いので
+フォントサイズ校正は仮の値で走っており、`px_per_char` は測定結果ではない。
 
 > **Chrome の起動フラグが必須。** `--disable-backgrounding-occluded-windows` 等を
 > 付けないと、ウィンドウを最小化・被覆した時点で capture が実質停止する
@@ -60,37 +67,43 @@ cargo test -p ke-cdp --test browser -- --ignored regenerate
 
 ---
 
-## 2. `ke-workflow` — 本番ループと再開
+## 2. `ke-store` — アーティファクトとイベントログ — **完了**
 
-`crates/ke-cdp/tests/browser.rs` の `Capture` と、
-`examples/probe.rs` の `capture_book` が原型になっている。両方とも
-「観測 → 判断 → 実行 → 記録」を回しているだけなので、これを製品コードにする。
-
-- **1 冊を通しで撮り切る**（現状は 15 枚までしか通していない）
-- 画素/文字の実測を Python 側に渡す（3 と連動）。いまは仮の対応表で代用している
-- lease と再開（ADR-0001 §3）
-
----
-
-## 3. `ke-store` — アーティファクトとイベントログ
-
-ADR-0001 §3 の配置を実装する。
+ADR-0001 §3 の配置を実装した。
 
 ```
-library/<book-id>/
-  manifest.json          # BookSpec
-  events.jsonl           # 追記専用のフェーズ遷移ログ（唯一の真実）
-  pages/raw/0001.png
-  text/0001.json
-  out/<title>.pdf
-  .lease/<phase>         # O_EXCL で作る排他ロック
+library/<ASIN>/
+  manifest.json          BookSpec
+  events.jsonl           追記専用のイベントログ（唯一の真実）
+  pages/raw/0001.png     capture の出力
+  sessions/*.jsonl       記録（1 の record/replay）
+  .lease/capture         フェーズの排他ロック
 ```
 
 - **単一 SQLite を置かない。** ネットワーク共有上ではロックが壊れる
-- ローカル SQLite は `events.jsonl` から再構築可能な索引に留める
-- テスト: tmpdir に作って途中で kill し、再開できることを確認する
+- ページ画像は一時ファイルに書いてから改名する。**中途半端な PNG を残さない**
+- lease は `O_EXCL` で作るファイル 1 個。**残ったロックを自動で奪わない**
+  （落ちたホストと二重に走るため）。誰が掴んでいるかを返して人間に判断させる
+- 進捗はイベントから組み立てる。同じ連番を数え直さないので、撮り直しても矛盾しない
 
----
+## 3. `ke-workflow` — capture フェーズ **完了**、他は未着手
+
+判断（`ke-nav`）・実行（`ke-cdp`）・保管（`ke-store`）・実測（[`Measurer`]）を
+噛み合わせる層。**この層自身は何も判断しない。**
+
+capture は実装済みで、実機で 30 枚を保管庫に落とすところまで通っている。
+
+> **再開は「途中から」ではなく「先頭から撮り直す」。** ページの連番は
+> 先頭から数えた枚数なので、同じ表示設定なら上書きは冪等になる。
+> N ページ目まで進めるにも結局 N 回送るので、差は画像取得の 17ms 分しかない。
+> 200 ページの撮り直しは 45 秒。落ちたときだけ払う費用としては安い。
+
+残り:
+
+- **`Measurer` の本実装**（4 と連動）。いまは `StubMeasurer` で走っており、
+  記録される `px_per_char` は測定結果ではない
+- validate / ocr / proofread / assemble の各フェーズ
+- フェーズグラフと、能力（`browser` / `cpu` / `gpu`）によるホストの振り分け
 
 ## 4. Python 側 — `ke_ocr` 常駐ワーカー
 
@@ -160,13 +173,13 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 
 ---
 
-## 8. `ke-imaging` / `ke-workflow` / `ke-cli`
+## 8. `ke-imaging` / `ke-cli`
 
 - **`ke-imaging`**: 白紙・重複・サイズ違いの検証だけ。**余白検出は不要**
-  （ADR-0004 決定 2 で `trim` フェーズを削除した）。rayon で並列化
-- **`ke-workflow`**: フェーズグラフ、lease、再開。`Summary.end_confirmed` が `false` の
-  書籍を `validate` で警告する
-- **`ke-cli`**: clap。単一バイナリ `ke`
+  （ADR-0004 決定 2 で `trim` フェーズを削除した）。rayon で並列化。
+  `Summary.end_confirmed` が `false` の書籍を警告する
+- **`ke-cli`**: clap。単一バイナリ `ke`。
+  `crates/ke-workflow/examples/shoot.rs` が原型になっている
 
 ---
 
@@ -186,7 +199,7 @@ MIT。出典は [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) に記載済
 
 | # | 内容 | 影響 |
 |---|---|---|
-| 1 | **1 冊の完走**。先頭から巻末まで一気に撮り切る経路 | ここまで来ないと所要時間の総計が出ない |
+| 1 | **1 冊の完走**。30 枚までは通した。巻末まで一気に撮り切るのは未実施 | 所要時間の総計が出ない |
 | 2 | **フォント段と画素/文字の対応表**。ADR-0005 は割合で測っており段番号では測っていない | 既定の目標段が決まらない。OCR 環境の再構築が要る |
 | 3 | `sideMarginsSize` / `maxNumberColumns` を UI から変えた効果。操作子は `#narrow` / `#medium` / `#wide` と特定済み | 同じフォントサイズでより多くの文字が入る可能性 |
 | 4 | マンガ（固定レイアウト）でも同じ `kg-full-page-img` 経路か | 経路分岐が要るかどうか |
@@ -264,6 +277,7 @@ GPU を使う場合の NVIDIA ランタイム（`os.add_dll_directory` が必要
 [`Observation`]: ../crates/ke-core/src/observation.rs
 [`Session`]: ../crates/ke-cdp/src/record.rs
 [`ReplayBrowser`]: ../crates/ke-cdp/src/record.rs
+[`Measurer`]: ../crates/ke-workflow/src/measure.rs
 
 ---
 
@@ -276,6 +290,9 @@ cargo run -p ke-cdp --example probe                # いま観測できること
 cargo run -p ke-cdp --example probe -- capture     # ページ画像を 1 枚取り出す
 cargo run -p ke-cdp --example probe -- settings 9  # 白テーマ + フォント段 9 にする
 cargo run -p ke-cdp --example probe -- turn 20     # 20 ページ送って所要時間を測る
+
+# 1 冊を撮って保管庫に置く（本番と同じ経路）
+cargo run -p ke-workflow --example shoot -- <ASIN> <保管庫のパス> [枚数の上限]
 ```
 
 セレクタは実機の DOM に依存しているので、リーダーの UI が変わるとここが最初に壊れる。

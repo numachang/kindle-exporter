@@ -1,0 +1,23 @@
+[package]
+name = "ke-workflow"
+description = "フェーズの実行と再開。判断（ke-nav）・実行（ke-cdp）・保管（ke-store）を噛み合わせる層。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# ここが合流点。ADR-0001 §5 でいう ke-workflow に当たる。
+[dependencies]
+ke-core = { workspace = true }
+ke-cdp = { path = "../ke-cdp" }
+ke-nav = { path = "../ke-nav" }
+ke-store = { path = "../ke-store" }
+
+[dev-dependencies]
+tempfile = "3"
+ke-cdp = { path = "../ke-cdp" }
+
+[lints]
+workspace = true
